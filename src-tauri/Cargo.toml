@@ -1,0 +1,36 @@
+[package]
+name = "podcut"
+version = "0.1.0"
+description = "AI-powered podcast editing workbench"
+authors = ["不可计算"]
+edition = "2021"
+
+[lib]
+name = "podcut_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["devtools"] }
+tauri-plugin-dialog = "2"
+tauri-plugin-fs = "2"
+tauri-plugin-shell = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", features = ["json", "stream", "gzip", "rustls-tls"], default-features = false }
+tokio = { version = "1", features = ["full"] }
+futures-util = "0.3"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[profile.dev]
+incremental = true
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+# panic = "unwind"（默认）: spawn_blocking 内的 panic 可被 JoinError 捕获而不崩溃整个 app
+# panic = "abort" 会让任何 panic 直接 SIGABRT，无法诊断、无法恢复
+strip = false  # 保留符号，方便 crash report 显示函数名

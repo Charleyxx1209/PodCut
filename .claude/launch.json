@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "podcut-dev",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "dev"],
+      "port": 1420
+    },
+    {
+      "name": "podcast-preview",
+      "runtimeExecutable": "/Users/chengxixi/Desktop/CCowork/PodCut/.claude/start-dev.sh",
+      "runtimeArgs": [],
+      "port": 1420
+    }
+  ]
+}

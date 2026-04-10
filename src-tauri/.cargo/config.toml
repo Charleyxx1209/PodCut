@@ -1,0 +1,5 @@
+[target.aarch64-apple-darwin]
+rustflags = ["-lc++", "-l", "framework=Accelerate", "-l", "framework=Metal", "-l", "framework=Foundation", "-l", "framework=CoreGraphics"]
+
+[env]
+MACOSX_DEPLOYMENT_TARGET = "10.15"
