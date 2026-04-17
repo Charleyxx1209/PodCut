@@ -153,7 +153,7 @@ export default function ProcessingView() {
           </div>
         )}
 
-        {/* 错误提示 */}
+        {/* 错误提示 + 重试按钮 */}
         {transcription_error && (
           <div style={{
             marginTop: '12px', padding: '10px 14px',
@@ -164,6 +164,41 @@ export default function ProcessingView() {
             lineHeight: 1.6, whiteSpace: 'pre-wrap', wordBreak: 'break-all',
           }}>
             {transcription_error}
+            <div style={{ marginTop: 8, display: 'flex', gap: 8 }}>
+              <button
+                onClick={() => {
+                  // 清除错误 + 重置 partial + 回到 idle → 触发 Workspace 重新启动转写
+                  useProjectStore.setState(s => ({
+                    project: s.project ? {
+                      ...s.project,
+                      transcription_error: undefined,
+                      transcription_progress: 0,
+                      chunks_partial: [],
+                      stage: 'idle' as const,
+                    } : null
+                  }))
+                }}
+                style={{
+                  padding: '5px 14px', fontSize: '12px', fontWeight: 500,
+                  background: 'var(--text)', color: 'var(--bg)',
+                  border: 'none', borderRadius: 5, cursor: 'pointer',
+                }}
+              >
+                重试
+              </button>
+              {project.chunks_partial.length > 0 && (
+                <button
+                  onClick={skipToRoughCut}
+                  style={{
+                    padding: '5px 14px', fontSize: '12px',
+                    background: 'transparent', color: 'var(--text-sub)',
+                    border: '1px solid var(--border)', borderRadius: 5, cursor: 'pointer',
+                  }}
+                >
+                  使用已有结果
+                </button>
+              )}
+            </div>
           </div>
         )}
       </div>

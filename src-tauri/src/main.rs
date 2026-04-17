@@ -1,5 +1,3 @@
-mod lib;
-
 fn main() {
-    lib::run();
+    podcut_lib::run();
 }

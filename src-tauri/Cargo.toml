@@ -1,6 +1,6 @@
 [package]
 name = "podcut"
-version = "0.1.0"
+version = "0.3.1"
 description = "AI-powered podcast editing workbench"
 authors = ["不可计算"]
 edition = "2021"

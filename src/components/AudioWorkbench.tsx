@@ -80,13 +80,14 @@ export default function AudioWorkbench({ onSeek, onTimeUpdate, seekTo }: AudioWo
   useEffect(() => {
     if (!audioUrl) { realWaveRef.current = null; return }
     let cancelled = false
+    let actx: AudioContext | null = null
     fetch(audioUrl)
       .then(r => r.arrayBuffer())
       .then(buf => {
         if (cancelled) return
-        const ctx = new AudioContext()
-        return ctx.decodeAudioData(buf).then(decoded => {
-          if (cancelled) return
+        actx = new AudioContext()
+        return actx.decodeAudioData(buf).then(decoded => {
+          if (cancelled) { actx?.close(); actx = null; return }
           const data = decoded.getChannelData(0)
           const N = 1200
           const block = Math.max(1, Math.floor(data.length / N))
@@ -100,11 +101,11 @@ export default function AudioWorkbench({ onSeek, onTimeUpdate, seekTo }: AudioWo
           })
           const maxP = Math.max(...peaks, 0.001)
           realWaveRef.current = peaks.map(p => p / maxP)
-          ctx.close()
+          actx?.close(); actx = null
         })
       })
-      .catch(() => {})
-    return () => { cancelled = true }
+      .catch(() => { actx?.close(); actx = null })
+    return () => { cancelled = true; actx?.close(); actx = null }
   }, [audioUrl])
 
   // ── 外部 seek 请求
@@ -145,6 +146,19 @@ export default function AudioWorkbench({ onSeek, onTimeUpdate, seekTo }: AudioWo
         const x1 = (chunk.t_end   / totalDur) * W
         ctx.fillStyle = `rgba(${cfg.rgb}, 0.04)`
         ctx.fillRect(x0, yTop + 2, x1 - x0, TRACK_H - 4)
+      }
+
+      // ── 静音段标记（淡灰斜纹底纹，仅在第一行画一次即可）
+      if (row === 0) {
+        const silences = project?.silences ?? []
+        for (const sil of silences) {
+          const sx0 = (sil.start / totalDur) * W
+          const sx1 = (sil.end   / totalDur) * W
+          const sw = Math.max(sx1 - sx0, 1)
+          // 淡灰竖纹
+          ctx.fillStyle = 'rgba(0,0,0,0.025)'
+          ctx.fillRect(sx0, 0, sw, spks.length * TRACK_H)
+        }
       }
 
       // ── 波形条
@@ -252,10 +266,41 @@ export default function AudioWorkbench({ onSeek, onTimeUpdate, seekTo }: AudioWo
   const { setMusicTrack, removeMusicTrack } = useProjectStore()
   const musicTracks = project?.musicTracks ?? {}
 
-  function handleAddMusic(type: 'intro' | 'outro') {
+  async function handleAddMusic(type: 'intro' | 'outro') {
+    let filePath: string | undefined
+    let fileName = type === 'intro' ? '片头曲' : '片尾曲'
+
+    if (isTauri()) {
+      try {
+        const { open } = await import('@tauri-apps/plugin-dialog')
+        const selected = await open({
+          filters: [{ name: '音频', extensions: ['mp3', 'wav', 'aac', 'm4a', 'flac', 'ogg'] }],
+          multiple: false,
+        })
+        if (!selected) return
+        filePath = typeof selected === 'string' ? selected : undefined
+        if (filePath) {
+          const base = filePath.split('/').pop() ?? filePath
+          fileName = base.replace(/\.[^.]+$/, '')
+        }
+      } catch { /* user cancelled */ return }
+    }
+
+    // 获取音频时长
+    let dur = 30
+    if (filePath && isTauri()) {
+      try {
+        const { invoke } = await import('@tauri-apps/api/core')
+        dur = await invoke<number>('get_audio_duration', { path: filePath })
+      } catch { /* fallback */ }
+    }
+
     const track: MusicTrack = {
-      type, duration: 30, fadeIn: 3, fadeOut: 5,
-      title: type === 'intro' ? '片头曲 · 清晨轻音乐' : '片尾曲 · 温柔收尾',
+      type, duration: dur,
+      fadeIn: type === 'intro' ? 3 : 0,
+      fadeOut: type === 'outro' ? 5 : 0,
+      title: fileName,
+      path: filePath,
     }
     setMusicTrack(track)
   }
@@ -508,6 +553,9 @@ export default function AudioWorkbench({ onSeek, onTimeUpdate, seekTo }: AudioWo
         </div>
       </div>
 
+      {/* ── 敏感词消音 ── */}
+      <SensitiveKeywordsBar />
+
       {/* 真实音频元素 */}
       <audio
         ref={audioRef}
@@ -540,5 +588,127 @@ function IconBtn({ children, onClick, title }: {
     }}>
       {children}
     </button>
+  )
+}
+
+// ── 敏感词消音管理栏 ──────────────────────────────────────────
+function SensitiveKeywordsBar() {
+  const { project, setSensitiveKeywords, autoMarkBeeps, removeBeepMark } = useProjectStore()
+  const [draft, setDraft] = useState('')
+  const [lastResult, setLastResult] = useState<string | null>(null)
+
+  if (!project) return null
+
+  const keywords = project.sensitiveKeywords
+  const beepCount = project.beepMarks.length
+
+  function addKeyword() {
+    const kw = draft.trim()
+    if (!kw || keywords.includes(kw)) return
+    setSensitiveKeywords([...keywords, kw])
+    setDraft('')
+  }
+
+  function removeKeyword(kw: string) {
+    setSensitiveKeywords(keywords.filter(k => k !== kw))
+  }
+
+  function handleAutoMark() {
+    const n = autoMarkBeeps()
+    setLastResult(n > 0 ? `新增 ${n} 处消音标记` : '未找到新的匹配')
+    setTimeout(() => setLastResult(null), 3000)
+  }
+
+  function clearAllBeeps() {
+    for (const bm of project!.beepMarks) removeBeepMark(bm.id)
+  }
+
+  return (
+    <div style={{
+      padding: '8px 20px 10px',
+      borderTop: '1px solid var(--border)',
+      display: 'flex', alignItems: 'center', gap: '12px',
+      flexWrap: 'wrap',
+    }}>
+      <span style={{ fontSize: '11px', color: 'var(--text-muted)', flexShrink: 0 }}>
+        敏感词消音
+      </span>
+
+      {/* 已有关键词标签 */}
+      {keywords.map(kw => (
+        <span key={kw} style={{
+          display: 'inline-flex', alignItems: 'center', gap: '4px',
+          padding: '2px 8px', fontSize: '11px',
+          background: 'var(--red-dim)', color: 'var(--red)',
+          borderRadius: '12px',
+        }}>
+          {kw}
+          <button onClick={() => removeKeyword(kw)} style={{
+            background: 'none', border: 'none', cursor: 'pointer',
+            color: 'var(--red)', fontSize: '11px', padding: 0, lineHeight: 1,
+          }}>×</button>
+        </span>
+      ))}
+
+      {/* 输入框 */}
+      <input
+        value={draft}
+        onChange={e => setDraft(e.target.value)}
+        onKeyDown={e => { if (e.key === 'Enter') addKeyword() }}
+        placeholder="输入敏感词…"
+        style={{
+          width: 100, padding: '3px 8px', fontSize: '11px',
+          border: '1px solid var(--border)', borderRadius: 4,
+          background: 'transparent', color: 'var(--text)',
+          outline: 'none',
+        }}
+        onFocus={e => (e.currentTarget.style.borderColor = 'var(--border-mid)')}
+        onBlur={e => (e.currentTarget.style.borderColor = 'var(--border)')}
+      />
+      <button onClick={addKeyword} disabled={!draft.trim()} style={{
+        fontSize: '10px', padding: '3px 8px',
+        background: draft.trim() ? 'var(--text)' : 'var(--border)',
+        color: draft.trim() ? 'var(--bg)' : 'var(--text-muted)',
+        border: 'none', borderRadius: 4, cursor: draft.trim() ? 'pointer' : 'default',
+      }}>
+        添加
+      </button>
+
+      {/* 自动标记按钮 */}
+      {keywords.length > 0 && (
+        <button onClick={handleAutoMark} style={{
+          fontSize: '10px', padding: '3px 10px',
+          background: 'var(--red-dim)', color: 'var(--red)',
+          border: '1px solid transparent', borderRadius: 4,
+          cursor: 'pointer', fontWeight: 500,
+        }}>
+          自动标记
+        </button>
+      )}
+
+      {/* beep 计数 + 清除 */}
+      {beepCount > 0 && (
+        <>
+          <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>
+            {beepCount} 处消音
+          </span>
+          <button onClick={clearAllBeeps} style={{
+            fontSize: '10px', padding: '2px 7px',
+            background: 'transparent', color: 'var(--text-muted)',
+            border: '1px solid var(--border)', borderRadius: 4,
+            cursor: 'pointer',
+          }}>
+            全部清除
+          </button>
+        </>
+      )}
+
+      {/* 反馈消息 */}
+      {lastResult && (
+        <span style={{ fontSize: '11px', color: 'var(--green)', fontWeight: 500 }}>
+          {lastResult}
+        </span>
+      )}
+    </div>
   )
 }

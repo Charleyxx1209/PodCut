@@ -16,7 +16,7 @@ export function fileBaseName(path: string): string {
 }
 
 /** Cap an array to the most-recent `max` items (used for undo stack) */
-export function cappedPush<T>(arr: T[], item: T, max = 50): T[] {
+export function cappedPush<T>(arr: T[], item: T, max = 20): T[] {
   const next = [...arr, item]
   return next.length > max ? next.slice(next.length - max) : next
 }

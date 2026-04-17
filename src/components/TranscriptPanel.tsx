@@ -270,6 +270,86 @@ function SpeakerGroup({ group, matchIds, currentMatchId, activeChunkId, searchQu
   )
 }
 
+// ─── 词级文本渲染 ───────────────────────────────────────────
+function WordLevelText({ chunk, searchQuery, onSeekClick }: {
+  chunk: Chunk
+  searchQuery: string
+  onSeekClick?: () => void
+}) {
+  const { deleteWords, restoreWords } = useProjectStore()
+  const words = chunk.words!
+  const hasDeleted = words.some(w => w.deleted)
+
+  // 选中词后弹出删除/恢复浮层
+  function handleMouseUp() {
+    const sel = window.getSelection()
+    if (!sel || sel.isCollapsed) return
+    const range = sel.getRangeAt(0)
+    // 找出选中范围内的词索引
+    const container = range.commonAncestorContainer
+    const spans = container instanceof HTMLElement
+      ? container.querySelectorAll('[data-widx]')
+      : container.parentElement?.closest('[data-chunk]')?.querySelectorAll('[data-widx]')
+    if (!spans) return
+    const indices: number[] = []
+    spans.forEach(el => {
+      if (sel.containsNode(el, true)) {
+        const idx = Number(el.getAttribute('data-widx'))
+        if (!isNaN(idx)) indices.push(idx)
+      }
+    })
+    if (indices.length === 0) return
+    const allDeleted = indices.every(i => words[i]?.deleted)
+    if (allDeleted) {
+      restoreWords(chunk.id, indices)
+    } else {
+      deleteWords(chunk.id, indices)
+    }
+    sel.removeAllRanges()
+  }
+
+  return (
+    <p
+      className="transcript-text selectable"
+      data-chunk={chunk.id}
+      onMouseUp={handleMouseUp}
+      onClick={() => { if (window.getSelection()?.isCollapsed) onSeekClick?.() }}
+      style={{
+        position: 'relative', zIndex: 1,
+        fontSize: '15px', lineHeight: 1.9,
+        margin: 0, cursor: 'text',
+      }}
+    >
+      {words.map((w, i) => (
+        <span
+          key={i}
+          data-widx={i}
+          title={w.deleted ? '点击选中区域可恢复' : undefined}
+          style={{
+            color: w.deleted ? 'var(--text-muted)' : 'var(--text-sub)',
+            textDecoration: w.deleted ? 'line-through' : 'none',
+            opacity: w.deleted ? 0.4 : 1,
+            borderRadius: 2,
+            transition: 'opacity 0.15s, color 0.15s',
+          }}
+          onMouseEnter={e => { if (!w.deleted) e.currentTarget.style.color = 'var(--text)' }}
+          onMouseLeave={e => { if (!w.deleted) e.currentTarget.style.color = 'var(--text-sub)' }}
+        >
+          {searchQuery ? highlightText(w.text, searchQuery) : w.text}
+        </span>
+      ))}
+      {hasDeleted && (
+        <span style={{
+          marginLeft: 6, fontSize: '10px', color: 'var(--amber)',
+          verticalAlign: 'super', userSelect: 'none',
+        }}>
+          {words.filter(w => w.deleted).length}词已删
+        </span>
+      )}
+    </p>
+  )
+}
+
 // ─── 单个可拖拽语义块 ─────────────────────────────────────
 function SortableChunk({ chunk, isMatch, isCurrent, isPlaying, searchQuery, chunkRefs, onSeekClick }: {
   chunk: Chunk
@@ -288,6 +368,7 @@ function SortableChunk({ chunk, isMatch, isCurrent, isPlaying, searchQuery, chun
   const isMisplaced = project?.move_ops.some(op => op.chunk_id === chunk.id && op.status === 'pending')
   const op = project?.move_ops.find(o => o.chunk_id === chunk.id && o.status === 'pending')
   const confidence = op?.confidence ?? 0
+  const hasWords = chunk.words && chunk.words.length > 0
 
   function toggleBeep() {
     if (beepMark) {
@@ -332,24 +413,28 @@ function SortableChunk({ chunk, isMatch, isCurrent, isPlaying, searchQuery, chun
           }} />
         )}
 
-        {/* 文本 */}
-        <p
-          className="transcript-text selectable"
-          onClick={onSeekClick}
-          style={{
-            position: 'relative', zIndex: 1,
-            fontSize: '15px', lineHeight: 1.9,
-            color: isPlaying ? 'var(--text)' : beepMark ? 'var(--text-muted)' : 'var(--text-sub)',
-            margin: 0, cursor: 'pointer',
-            fontWeight: isPlaying ? 500 : 400,
-            textDecoration: beepMark ? 'line-through' : 'none',
-            transition: 'color 0.2s',
-          }}
-          onMouseEnter={e => { if (!beepMark) e.currentTarget.style.color = 'var(--text)' }}
-          onMouseLeave={e => { if (!beepMark) e.currentTarget.style.color = isPlaying ? 'var(--text)' : 'var(--text-sub)' }}
-        >
-          {highlightText(chunk.text, searchQuery)}
-        </p>
+        {/* 文本：有词级数据时用 WordLevelText，否则 fallback */}
+        {hasWords ? (
+          <WordLevelText chunk={chunk} searchQuery={searchQuery} onSeekClick={onSeekClick} />
+        ) : (
+          <p
+            className="transcript-text selectable"
+            onClick={onSeekClick}
+            style={{
+              position: 'relative', zIndex: 1,
+              fontSize: '15px', lineHeight: 1.9,
+              color: isPlaying ? 'var(--text)' : beepMark ? 'var(--text-muted)' : 'var(--text-sub)',
+              margin: 0, cursor: 'pointer',
+              fontWeight: isPlaying ? 500 : 400,
+              textDecoration: beepMark ? 'line-through' : 'none',
+              transition: 'color 0.2s',
+            }}
+            onMouseEnter={e => { if (!beepMark) e.currentTarget.style.color = 'var(--text)' }}
+            onMouseLeave={e => { if (!beepMark) e.currentTarget.style.color = isPlaying ? 'var(--text)' : 'var(--text-sub)' }}
+          >
+            {highlightText(chunk.text, searchQuery)}
+          </p>
+        )}
 
         {/* beep 标签 */}
         {beepMark && (
@@ -376,6 +461,27 @@ function SortableChunk({ chunk, isMatch, isCurrent, isPlaying, searchQuery, chun
           >
             {beepMark ? '×' : 'M'}
           </button>
+        )}
+
+        {/* 插话标记 */}
+        {chunk.interjections && chunk.interjections.length > 0 && (
+          <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap', marginTop: '2px', paddingLeft: '2px' }}>
+            {chunk.interjections.map((ij, idx) => {
+              const ijCfg = getSpeakerConfig(ij.speakerId)
+              return (
+                <span key={idx} title={`${fmt(ij.start)} ${ij.text}`} style={{
+                  display: 'inline-flex', alignItems: 'center', gap: '4px',
+                  fontSize: '11px', color: 'var(--text-muted)',
+                  background: `rgba(${ijCfg.rgb}, 0.08)`,
+                  border: `1px solid rgba(${ijCfg.rgb}, 0.15)`,
+                  borderRadius: 10, padding: '1px 8px',
+                }}>
+                  <span style={{ width: 4, height: 4, borderRadius: '50%', background: ijCfg.color, opacity: 0.6 }} />
+                  {ij.text.length > 8 ? ij.text.slice(0, 8) + '…' : ij.text}
+                </span>
+              )
+            })}
+          </div>
         )}
 
         {/* 拖拽手柄 */}

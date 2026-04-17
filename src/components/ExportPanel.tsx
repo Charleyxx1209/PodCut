@@ -2,9 +2,10 @@
  * ExportPanel — 导出音频 + 小宇宙上传
  * 以抽屉形式从右侧滑入，覆盖在精剪工作台上方
  */
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { useProjectStore } from '@/store/project'
-import { fmt } from '@/lib/utils'
+import { fmt, isTauri } from '@/lib/utils'
+import { generateRssXml, type RssConfig } from '@/lib/rss'
 
 type AudioFmt = 'mp3' | 'wav' | 'aac' | 'flac'
 
@@ -26,9 +27,38 @@ export default function ExportPanel({ onClose }: { onClose: () => void }) {
   const { project } = useProjectStore()
   const [format, setFormat] = useState<AudioFmt>('mp3')
   const [bitrateIdx, setBitrateIdx] = useState(2)  // default 256 kbps
-  const [cosmoConnected, setCosmoConnected] = useState(false)
   const [exporting, setExporting] = useState(false)
   const [exported, setExported] = useState(false)
+  const [exportedPath, setExportedPath] = useState('')
+  const [exportedSize, setExportedSize] = useState(0)  // bytes
+  const [exportError, setExportError] = useState('')
+  const [progressMsg, setProgressMsg] = useState('')
+  const [progressPct, setProgressPct] = useState(0)
+
+  // 监听导出进度事件（Tauri）
+  useEffect(() => {
+    if (!isTauri()) return
+    let unlisten: (() => void) | undefined
+    import('@tauri-apps/api/event').then(({ listen }) => {
+      listen<{ pct: number; msg: string }>('export_progress', (e) => {
+        setProgressMsg(e.payload.msg)
+        setProgressPct(e.payload.pct)
+      }).then(fn => { unlisten = fn })
+    })
+    return () => { unlisten?.() }
+  }, [])
+
+  // 在 Finder / 文件管理器中显示已导出文件
+  async function showInFinder() {
+    if (!isTauri() || !exportedPath) return
+    try {
+      const { Command } = await import('@tauri-apps/plugin-shell')
+      // macOS: open -R 选中文件
+      await Command.create('open', ['-R', exportedPath]).execute()
+    } catch (e) {
+      console.error('showInFinder failed:', e)
+    }
+  }
 
   if (!project) return null
 
@@ -44,18 +74,142 @@ export default function ExportPanel({ onClose }: { onClose: () => void }) {
   const bitrates = BITRATE_OPTIONS[format]
   const safeIdx = Math.min(bitrateIdx, bitrates.length - 1)
 
-  function handleExport() {
+  async function handleExport() {
     setExporting(true)
-    // Simulate export (real: invoke Tauri command)
-    setTimeout(() => {
-      setExporting(false)
-      setExported(true)
-    }, 2200)
-  }
+    setExportError('')
+    setProgressMsg('准备导出…')
+    setProgressPct(0)
 
-  function handleCosmoConnect() {
-    // Placeholder: real implementation would trigger OAuth flow
-    setTimeout(() => setCosmoConnected(true), 600)
+    try {
+      if (isTauri() && project?.audio_path) {
+        // 构建保留片段的时间范围列表（按时间排序 + 合并重叠）
+        const rawSegs: [number, number][] = kept
+          .map(c => [c.t_start, c.t_end] as [number, number])
+          .sort((a, b) => a[0] - b[0])
+        const segments: [number, number][] = []
+        for (const seg of rawSegs) {
+          const prev = segments[segments.length - 1]
+          if (prev && seg[0] <= prev[1]) {
+            // 重叠或相邻 → 合并
+            prev[1] = Math.max(prev[1], seg[1])
+          } else {
+            segments.push([...seg])
+          }
+        }
+
+        // 弹出文件保存对话框
+        const { save } = await import('@tauri-apps/plugin-dialog')
+        const ext = format === 'aac' ? 'm4a' : format
+        const savePath = await save({
+          defaultPath: `${project!.name.replace(/\s+/g, '_')}.${ext}`,
+          filters: [{ name: format.toUpperCase(), extensions: [ext] }],
+        })
+        if (!savePath) {
+          setExporting(false)
+          setProgressMsg('')
+          return
+        }
+
+        // 调用 Rust 导出命令（含音乐轨 + beep 标记）
+        const { invoke } = await import('@tauri-apps/api/core')
+
+        // 计算 beep 时间范围（需从原始音频时间轴映射到 concat 后的时间轴）
+        // concat 后的时间 = 该 segment 在 kept 列表中的累计偏移
+        const beepRanges: [number, number][] = []
+        if (project!.beepMarks.length > 0) {
+          // 构建原始时间 → concat 时间的映射
+          let offset = 0
+          for (const seg of segments) {
+            const segLen = seg[1] - seg[0]
+            for (const bm of project!.beepMarks) {
+              // 如果 beep 范围与此段重叠，映射到 concat 时间
+              const overlapStart = Math.max(bm.tStart, seg[0])
+              const overlapEnd = Math.min(bm.tEnd, seg[1])
+              if (overlapStart < overlapEnd) {
+                beepRanges.push([
+                  offset + (overlapStart - seg[0]),
+                  offset + (overlapEnd - seg[0]),
+                ])
+              }
+            }
+            offset += segLen
+          }
+        }
+
+        const intro = project!.musicTracks.intro
+        const outro = project!.musicTracks.outro
+
+        // 构建章节标记（sections → ffmpeg chapters）
+        const chapterMarkers: { title: string; start_ms: number; end_ms: number }[] = []
+        if (project!.sections.length > 0) {
+          // 计算每个 section 在 concat 时间线上的起止
+          let concatOffset = 0
+          const sectionStarts: Record<string, number> = {}
+          const sectionEnds: Record<string, number> = {}
+          for (const seg of segments) {
+            const segLen = seg[1] - seg[0]
+            // 找到此段对应的 chunk，确定所属 section
+            for (const chunk of kept) {
+              if (chunk.t_start >= seg[0] && chunk.t_start < seg[1] && chunk.section_id) {
+                const sid = chunk.section_id
+                if (!(sid in sectionStarts)) sectionStarts[sid] = concatOffset + (chunk.t_start - seg[0])
+                sectionEnds[sid] = concatOffset + Math.min(chunk.t_end - seg[0], segLen)
+              }
+            }
+            concatOffset += segLen
+          }
+          for (const sec of project!.sections) {
+            if (sec.id in sectionStarts) {
+              chapterMarkers.push({
+                title: sec.title,
+                start_ms: Math.round(sectionStarts[sec.id] * 1000),
+                end_ms: Math.round((sectionEnds[sec.id] ?? sectionStarts[sec.id] + 1) * 1000),
+              })
+            }
+          }
+        }
+
+        const result = await invoke<string>('export_audio', {
+          inputPath: project!.audio_path,
+          segments,
+          format,
+          quality: bitrates[safeIdx],
+          outputPath: savePath,
+          introPath: intro?.path ?? null,
+          introFadeIn: intro?.fadeIn ?? null,
+          introFadeOut: intro?.fadeOut ?? null,
+          outroPath: outro?.path ?? null,
+          outroFadeIn: outro?.fadeIn ?? null,
+          outroFadeOut: outro?.fadeOut ?? null,
+          beepRanges: beepRanges.length > 0 ? beepRanges : null,
+          metaTitle: project!.name || null,
+          metaArtist: null,
+          metaAlbum: null,
+          chapters: chapterMarkers.length > 0 ? chapterMarkers : null,
+        })
+
+        const info = JSON.parse(result)
+        setExportedPath(info.path)
+        setExportedSize(info.size ?? 0)
+        setExported(true)
+      } else {
+        // DEV 模式模拟
+        for (let p = 0; p <= 100; p += 10) {
+          await new Promise(r => setTimeout(r, 120))
+          setProgressPct(p)
+          setProgressMsg(`模拟进度 ${p}%`)
+        }
+        setExportedSize(1024 * 1024 * 12)  // 12 MB 假数据
+        setExportedPath('/tmp/mock-export.mp3')
+        setExported(true)
+      }
+    } catch (e: any) {
+      setExportError(String(e?.message ?? e))
+    } finally {
+      setExporting(false)
+      setProgressMsg('')
+      setProgressPct(0)
+    }
   }
 
   return (
@@ -152,117 +306,95 @@ export default function ExportPanel({ onClose }: { onClose: () => void }) {
           {/* ── 本地导出 ── */}
           <Section title="本地保存">
             {exported ? (
-              <div style={{
-                display: 'flex', alignItems: 'center', gap: '8px',
-                padding: '10px 14px',
-                background: 'rgba(120,140,93,0.1)',
-                border: '1px solid rgba(120,140,93,0.3)',
-                borderRadius: 8,
-              }}>
-                <span style={{ fontSize: '16px' }}>✓</span>
-                <span style={{ fontSize: '13px', color: 'var(--green)', fontWeight: 500 }}>
-                  已保存为 {project.name}.{format}
-                </span>
-              </div>
-            ) : (
-              <button
-                onClick={handleExport}
-                disabled={exporting}
-                style={{
-                  width: '100%', padding: '10px',
-                  fontSize: '13px', fontWeight: 500,
-                  background: exporting ? 'var(--bg-subtle)' : 'var(--text)',
-                  color: exporting ? 'var(--text-muted)' : 'var(--bg)',
-                  border: 'none', borderRadius: 8, cursor: exporting ? 'default' : 'pointer',
-                  transition: 'background 0.15s',
-                }}
-              >
-                {exporting ? '正在合成…' : `导出 ${format.toUpperCase()} 文件`}
-              </button>
-            )}
-          </Section>
-
-          {/* ── 小宇宙 ── */}
-          <Section title="上传至小宇宙">
-            {cosmoConnected ? (
               <div>
                 <div style={{
                   display: 'flex', alignItems: 'center', gap: '8px',
-                  padding: '8px 12px', marginBottom: 10,
-                  background: 'var(--bg-subtle)',
-                  borderRadius: 8, border: '1px solid var(--border)',
+                  padding: '10px 14px',
+                  background: 'rgba(120,140,93,0.1)',
+                  border: '1px solid rgba(120,140,93,0.3)',
+                  borderRadius: 8,
                 }}>
-                  <div style={{
-                    width: 28, height: 28, borderRadius: '50%',
-                    background: 'var(--accent)', display: 'flex', alignItems: 'center', justifyContent: 'center',
-                    flexShrink: 0,
-                  }}>
-                    <span style={{ fontSize: '12px', color: 'var(--bg)', fontWeight: 600 }}>宙</span>
+                  <span style={{ fontSize: '16px' }}>✓</span>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontSize: '13px', color: 'var(--green)', fontWeight: 500 }}>
+                      导出完成 {exportedSize > 0 && <span style={{ color: 'var(--text-muted)', fontWeight: 400, marginLeft: 6 }}>· {fmtBytes(exportedSize)}</span>}
+                    </div>
+                    {exportedPath && (
+                      <div style={{ fontSize: '11px', color: 'var(--text-muted)', marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                        {exportedPath}
+                      </div>
+                    )}
                   </div>
-                  <div style={{ flex: 1 }}>
-                    <div style={{ fontSize: '12px', fontWeight: 500, color: 'var(--text)' }}>已连接小宇宙</div>
-                    <div style={{ fontSize: '11px', color: 'var(--text-muted)' }}>播客主页 · 3 个节目</div>
-                  </div>
-                  <button onClick={() => setCosmoConnected(false)} style={{
-                    fontSize: '11px', color: 'var(--text-muted)',
-                    background: 'transparent', border: 'none', cursor: 'pointer', padding: '2px 6px',
-                  }}>断开</button>
                 </div>
-
-                <div style={{ marginBottom: 10 }}>
-                  <div style={{ fontSize: '11px', color: 'var(--text-muted)', marginBottom: 6 }}>上传到</div>
-                  <select style={{
-                    width: '100%', padding: '8px 10px', fontSize: '13px',
-                    border: '1px solid var(--border)', borderRadius: 8,
-                    background: 'var(--bg)', color: 'var(--text)',
-                    outline: 'none',
-                  }}>
-                    <option>技术与社会 — EP 42</option>
-                    <option>新建草稿</option>
-                  </select>
+                <div style={{ display: 'flex', gap: '8px', marginTop: 8 }}>
+                  {isTauri() && (
+                    <button onClick={showInFinder} style={secondaryBtnStyle}>
+                      在 Finder 中显示
+                    </button>
+                  )}
+                  <button onClick={() => { setExported(false); setExportedPath(''); setExportedSize(0) }} style={secondaryBtnStyle}>
+                    再次导出
+                  </button>
                 </div>
-
+              </div>
+            ) : (
+              <>
                 <button
-                  disabled={!exported}
+                  onClick={handleExport}
+                  disabled={exporting}
                   style={{
                     width: '100%', padding: '10px',
                     fontSize: '13px', fontWeight: 500,
-                    background: exported ? 'var(--accent)' : 'var(--bg-subtle)',
-                    color: exported ? 'white' : 'var(--text-muted)',
-                    border: 'none', borderRadius: 8,
-                    cursor: exported ? 'pointer' : 'default',
+                    background: exporting ? 'var(--bg-subtle)' : 'var(--text)',
+                    color: exporting ? 'var(--text-muted)' : 'var(--bg)',
+                    border: 'none', borderRadius: 8, cursor: exporting ? 'default' : 'pointer',
                     transition: 'background 0.15s',
                   }}
-                  title={!exported ? '请先导出音频文件' : ''}
                 >
-                  上传至小宇宙
+                  {exporting ? (progressMsg || '正在合成…') : `导出 ${format.toUpperCase()} 文件`}
                 </button>
-                {!exported && (
-                  <p style={{ fontSize: '11px', color: 'var(--text-muted)', margin: '6px 0 0', textAlign: 'center' }}>
-                    请先完成本地导出
-                  </p>
+
+                {/* 进度条 */}
+                {exporting && (
+                  <div style={{ marginTop: 10 }}>
+                    <div style={{
+                      height: 4, background: 'var(--border)', borderRadius: 2, overflow: 'hidden',
+                    }}>
+                      <div style={{
+                        height: '100%', width: `${progressPct}%`,
+                        background: 'var(--accent)',
+                        transition: 'width 0.25s ease',
+                      }} />
+                    </div>
+                    <div style={{
+                      fontSize: '11px', color: 'var(--text-muted)',
+                      marginTop: 4, textAlign: 'right', fontVariantNumeric: 'tabular-nums',
+                    }}>
+                      {progressPct}%
+                    </div>
+                  </div>
                 )}
-              </div>
-            ) : (
-              <div style={{ textAlign: 'center', padding: '16px 0' }}>
-                <p style={{ fontSize: '13px', color: 'var(--text-sub)', margin: '0 0 14px' }}>
-                  连接小宇宙账号，导出后一键发布节目
-                </p>
-                <button onClick={handleCosmoConnect} style={{
-                  padding: '9px 22px', fontSize: '13px', fontWeight: 500,
-                  background: 'transparent',
-                  border: '1px solid var(--border)',
-                  borderRadius: 8, cursor: 'pointer',
-                  color: 'var(--text-sub)',
-                  transition: 'border-color 0.15s, color 0.15s',
-                }}
-                  onMouseEnter={e => { e.currentTarget.style.borderColor = 'var(--text)'; e.currentTarget.style.color = 'var(--text)' }}
-                  onMouseLeave={e => { e.currentTarget.style.borderColor = 'var(--border)'; e.currentTarget.style.color = 'var(--text-sub)' }}
-                >
-                  连接小宇宙
-                </button>
-              </div>
+
+                {exportError && (
+                  <div style={{
+                    marginTop: 8, padding: '8px 12px', fontSize: '12px',
+                    color: 'var(--red, #c44)', background: 'rgba(200,60,60,0.06)',
+                    border: '1px solid rgba(200,60,60,0.2)', borderRadius: 6,
+                  }}>
+                    {exportError}
+                  </div>
+                )}
+              </>
             )}
+          </Section>
+
+          {/* ── 小宇宙 RSS ── */}
+          <Section title="小宇宙 RSS 发布">
+            <RssExportSection
+              project={project}
+              defaultAudioSize={exportedSize}
+              defaultAudioFormat={format}
+            />
           </Section>
 
           {/* JSON 数据导出 */}
@@ -285,6 +417,23 @@ export default function ExportPanel({ onClose }: { onClose: () => void }) {
       </div>
     </>
   )
+}
+
+const secondaryBtnStyle: React.CSSProperties = {
+  flex: 1, padding: '7px',
+  fontSize: '12px', fontWeight: 500,
+  background: 'transparent',
+  color: 'var(--text-sub)',
+  border: '1px solid var(--border)',
+  borderRadius: 6, cursor: 'pointer',
+  transition: 'border-color 0.15s, color 0.15s',
+}
+
+function fmtBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`
 }
 
 function dl(content: string, filename: string, mime: string) {
@@ -339,5 +488,152 @@ function ExportDataBtn({ label, onClick }: { label: string; onClick: () => void 
     >
       {label}
     </button>
+  )
+}
+
+// ── RSS 导出子组件 ─────────────────────────────────────────────────────
+function RssExportSection({ project, defaultAudioSize, defaultAudioFormat }: {
+  project: NonNullable<ReturnType<typeof useProjectStore.getState>['project']>
+  defaultAudioSize?: number       // 来自上一步导出的音频文件大小
+  defaultAudioFormat?: AudioFmt   // 来自上一步导出的音频格式
+}) {
+  const [podcastTitle, setPodcastTitle] = useState(project.name)
+  const [audioUrl, setAudioUrl] = useState('')
+  const [author, setAuthor] = useState('')
+  const [rssGenerated, setRssGenerated] = useState(false)
+
+  const inputStyle: React.CSSProperties = {
+    width: '100%', padding: '7px 10px', fontSize: '13px',
+    border: '1px solid var(--border)', borderRadius: 6,
+    background: 'var(--bg)', color: 'var(--text)',
+    outline: 'none',
+  }
+
+  // 根据导出的格式映射 MIME 类型
+  const audioMime: RssConfig['audioType'] | undefined = defaultAudioFormat ? ({
+    mp3: 'audio/mpeg' as const,
+    aac: 'audio/x-m4a' as const,
+    wav: 'audio/wav' as const,
+    flac: 'audio/flac' as const,
+  })[defaultAudioFormat] : undefined
+
+  function handleGenerateRss() {
+    const config: RssConfig = {
+      podcastTitle,
+      episodeTitle: project.name,
+      audioUrl: audioUrl || 'https://your-cdn.com/episode.mp3',
+      audioSize: defaultAudioSize,
+      audioType: audioMime,
+      author: author || undefined,
+    }
+    const xml = generateRssXml(project, config)
+    const name = project.name.replace(/\s+/g, '_')
+    dl(xml, `${name}_feed.xml`, 'application/xml')
+    setRssGenerated(true)
+  }
+
+  return (
+    <div>
+      <p style={{ fontSize: '12px', color: 'var(--text-muted)', margin: '0 0 12px', lineHeight: 1.6 }}>
+        生成标准播客 RSS XML（含章节标记），提交给小宇宙认领后自动同步。
+      </p>
+
+      <div style={{ display: 'flex', flexDirection: 'column', gap: '10px', marginBottom: 14 }}>
+        <div>
+          <label style={{ fontSize: '11px', color: 'var(--text-muted)', display: 'block', marginBottom: 4 }}>播客名称</label>
+          <input
+            value={podcastTitle}
+            onChange={e => setPodcastTitle(e.target.value)}
+            style={inputStyle}
+            placeholder="我的播客"
+          />
+        </div>
+        <div>
+          <label style={{ fontSize: '11px', color: 'var(--text-muted)', display: 'block', marginBottom: 4 }}>
+            音频文件 URL
+            <span style={{ color: 'var(--text-muted)', fontWeight: 400 }}> — 上传音频到 CDN/OSS 后填写</span>
+          </label>
+          <input
+            value={audioUrl}
+            onChange={e => setAudioUrl(e.target.value)}
+            style={inputStyle}
+            placeholder="https://your-cdn.com/episode.mp3"
+          />
+          {defaultAudioSize ? (
+            <div style={{ fontSize: '10px', color: 'var(--text-muted)', marginTop: 4 }}>
+              ✓ 已自动填入音频大小 {fmtBytes(defaultAudioSize)}（来自上一步导出）
+            </div>
+          ) : null}
+        </div>
+        <div>
+          <label style={{ fontSize: '11px', color: 'var(--text-muted)', display: 'block', marginBottom: 4 }}>作者（可选）</label>
+          <input
+            value={author}
+            onChange={e => setAuthor(e.target.value)}
+            style={inputStyle}
+            placeholder="主播名"
+          />
+        </div>
+      </div>
+
+      {/* 章节预览 */}
+      {project.sections.length > 0 && (
+        <div style={{ marginBottom: 12 }}>
+          <div style={{ fontSize: '11px', color: 'var(--text-muted)', marginBottom: 6 }}>章节标记（自动包含）</div>
+          <div style={{
+            padding: '8px 10px', fontSize: '12px',
+            background: 'var(--bg-subtle)', borderRadius: 6,
+            border: '1px solid var(--border)',
+            maxHeight: 100, overflow: 'auto',
+          }}>
+            {project.sections.map((sec) => (
+              <div key={sec.id} style={{ color: 'var(--text-sub)', marginBottom: 2 }}>
+                <span style={{ color: 'var(--text-muted)', fontVariantNumeric: 'tabular-nums', marginRight: 8 }}>
+                  {fmt(project.chunks.find(c => c.section_id === sec.id)?.t_start ?? 0)}
+                </span>
+                {sec.title}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {rssGenerated ? (
+        <div style={{
+          display: 'flex', alignItems: 'center', gap: '8px',
+          padding: '10px 14px',
+          background: 'rgba(120,140,93,0.1)',
+          border: '1px solid rgba(120,140,93,0.3)',
+          borderRadius: 8,
+        }}>
+          <span style={{ fontSize: '16px' }}>✓</span>
+          <div style={{ flex: 1 }}>
+            <div style={{ fontSize: '13px', color: 'var(--green)', fontWeight: 500 }}>RSS XML 已下载</div>
+            <div style={{ fontSize: '11px', color: 'var(--text-muted)', marginTop: 2 }}>
+              提交到小宇宙创作者后台即可同步
+            </div>
+          </div>
+          <button onClick={() => setRssGenerated(false)} style={{
+            fontSize: '11px', color: 'var(--text-muted)',
+            background: 'transparent', border: 'none', cursor: 'pointer',
+          }}>重新生成</button>
+        </div>
+      ) : (
+        <button onClick={handleGenerateRss} style={{
+          width: '100%', padding: '10px',
+          fontSize: '13px', fontWeight: 500,
+          background: 'transparent',
+          color: 'var(--text-sub)',
+          border: '1px solid var(--border)',
+          borderRadius: 8, cursor: 'pointer',
+          transition: 'border-color 0.15s, color 0.15s',
+        }}
+          onMouseEnter={e => { e.currentTarget.style.borderColor = 'var(--text)'; e.currentTarget.style.color = 'var(--text)' }}
+          onMouseLeave={e => { e.currentTarget.style.borderColor = 'var(--border)'; e.currentTarget.style.color = 'var(--text-sub)' }}
+        >
+          生成 RSS XML
+        </button>
+      )}
+    </div>
   )
 }

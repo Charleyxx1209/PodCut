@@ -1,8 +1,9 @@
 import { useRef, useState, useEffect } from 'react'
 import { useProjectStore } from '@/store/project'
 import AppIcon from './AppIcon'
-import { detectOllama } from '@/lib/postProcess'
+import { detectOllama, detectWhisperX } from '@/lib/postProcess'
 import { isTauri, fileBaseName } from '@/lib/utils'
+import { loadProjectFile } from '@/lib/projectFile'
 
 export default function Welcome() {
   const createProject = useProjectStore(s => s.createProject)
@@ -11,7 +12,9 @@ export default function Welcome() {
   const [filename, setFilename] = useState('')
   const [dragging, setDragging] = useState(false)
   const [apiKey, setApiKey] = useState(() => localStorage.getItem('podcut_api_key') ?? '')
+  const [hfToken, setHfToken] = useState(() => localStorage.getItem('podcut_hf_token') ?? '')
   const [ollamaModel, setOllamaModel] = useState<string | null | 'checking'>('checking')
+  const [whisperxInfo, setWhisperxInfo] = useState<{ available: boolean; version?: string } | 'checking'>('checking')
 
   function saveApiKey(val: string) {
     setApiKey(val)
@@ -19,9 +22,16 @@ export default function Welcome() {
     else localStorage.removeItem('podcut_api_key')
   }
 
+  function saveHfToken(val: string) {
+    setHfToken(val)
+    if (val.trim()) localStorage.setItem('podcut_hf_token', val.trim())
+    else localStorage.removeItem('podcut_hf_token')
+  }
+
   useEffect(() => {
     let alive = true
     detectOllama().then(m => { if (alive) setOllamaModel(m) })
+    detectWhisperX().then(info => { if (alive) setWhisperxInfo(info) })
     return () => { alive = false }
   }, [])
 
@@ -64,7 +74,7 @@ export default function Welcome() {
     if (!isTauri()) return
     let cleanup: (() => void) | undefined
     import('@tauri-apps/api/webview').then(({ getCurrentWebview }) => {
-      getCurrentWebview().onDragDropEvent(event => {
+      getCurrentWebview().onDragDropEvent(async (event) => {
         const type = event.payload.type
         console.log('[DragDrop]', type, event.payload)
         if (type === 'enter' || type === 'over') {
@@ -78,6 +88,20 @@ export default function Welcome() {
           const filePath = paths?.[0]
           console.log('[DragDrop] dropped filePath:', filePath)
           if (filePath) {
+            // .podcut 文件 → 打开工程
+            if (filePath.endsWith('.podcut')) {
+              const { readTextFile } = await import('@tauri-apps/plugin-fs')
+              const { deserializeProject } = await import('@/lib/projectFile')
+              try {
+                const content = await readTextFile(filePath)
+                const project = deserializeProject(content)
+                useProjectStore.setState({ project })
+              } catch (e) {
+                console.error('[DragDrop] .podcut parse error:', e)
+              }
+              return
+            }
+            // 音视频文件 → 新建项目
             const name = fileBaseName(filePath)
             createProject(name, filePath)
           }
@@ -190,8 +214,26 @@ export default function Welcome() {
             {btnLabel}
           </button>
 
+          <button
+            onClick={() => loadProjectFile()}
+            style={{
+              padding: '10px 24px',
+              background: 'transparent',
+              color: 'var(--text-sub)',
+              border: '1px solid var(--border)',
+              borderRadius: 'var(--r-md)',
+              fontSize: '13px', fontWeight: 500,
+              cursor: 'pointer',
+              transition: 'border-color 0.2s, color 0.2s'
+            }}
+            onMouseEnter={e => { e.currentTarget.style.borderColor = 'var(--border-mid)'; e.currentTarget.style.color = 'var(--text)' }}
+            onMouseLeave={e => { e.currentTarget.style.borderColor = 'var(--border)'; e.currentTarget.style.color = 'var(--text-sub)' }}
+          >
+            打开工程文件
+          </button>
+
           <span style={{ fontSize: '12px', color: 'var(--text-muted)' }}>
-            支持 .mp4 · .mov · .webm · .mp3 · .wav · .m4a
+            支持 .mp4 · .mov · .webm · .mp3 · .wav · .m4a · .podcut
           </span>
 
           {import.meta.env.DEV && (
@@ -268,6 +310,83 @@ export default function Welcome() {
             AI 分析引擎
           </div>
 
+          {/* WhisperX 状态 */}
+          {whisperxInfo !== 'checking' && whisperxInfo.available && (
+            <div style={{
+              display: 'flex', alignItems: 'center', gap: '8px',
+              padding: '8px 12px', borderRadius: 6, marginBottom: '8px',
+              background: 'rgba(100,130,180,0.08)', border: '1px solid rgba(100,130,180,0.2)',
+            }}>
+              <div style={{ width: 6, height: 6, borderRadius: '50%', background: 'var(--blue, #5b8abf)', flexShrink: 0 }} />
+              <div style={{ flex: 1 }}>
+                <div style={{ fontSize: '12px', fontWeight: 500, color: 'var(--text)' }}>
+                  WhisperX v{whisperxInfo.version}
+                </div>
+                <div style={{ fontSize: '11px', color: 'var(--text-muted)' }}>
+                  {hfToken ? '已就绪，将优先用于说话人分离' : '需配置 HuggingFace Token'}
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* WhisperX HF Token 输入 */}
+          {whisperxInfo !== 'checking' && whisperxInfo.available && !hfToken && (
+            <div style={{ marginBottom: '8px' }}>
+              <input
+                type="password"
+                value={hfToken}
+                onChange={e => saveHfToken(e.target.value)}
+                placeholder="hf_…（HuggingFace Access Token）"
+                style={{
+                  width: '100%', padding: '8px 12px',
+                  fontSize: '12px', fontFamily: 'var(--font-ui)',
+                  border: '1px solid var(--border)',
+                  borderRadius: 6, background: 'var(--bg)',
+                  color: 'var(--text)', outline: 'none',
+                  boxSizing: 'border-box',
+                }}
+                onFocus={e => (e.currentTarget.style.borderColor = 'var(--border-mid)')}
+                onBlur={e => (e.currentTarget.style.borderColor = 'var(--border)')}
+              />
+              <div style={{ fontSize: '11px', color: 'var(--text-muted)', marginTop: '4px' }}>
+                说话人分离需要 HuggingFace Token（huggingface.co/settings/tokens）
+              </div>
+            </div>
+          )}
+          {whisperxInfo !== 'checking' && whisperxInfo.available && hfToken && (
+            <div style={{ fontSize: '11px', color: 'var(--green)', marginBottom: '8px' }}>
+              HF Token 已配置
+              <button
+                onClick={() => saveHfToken('')}
+                style={{
+                  background: 'none', border: 'none', color: 'var(--text-muted)',
+                  fontSize: '11px', cursor: 'pointer', marginLeft: '8px', textDecoration: 'underline',
+                }}
+              >
+                清除
+              </button>
+            </div>
+          )}
+
+          {/* WhisperX 未安装提示 */}
+          {whisperxInfo !== 'checking' && !whisperxInfo.available && (
+            <details style={{ marginBottom: '8px', fontSize: '12px', color: 'var(--text-muted)' }}>
+              <summary style={{ cursor: 'pointer', marginBottom: '6px' }}>
+                WhisperX 未安装（可选，精确说话人分离）
+              </summary>
+              <div style={{
+                padding: '8px 12px', borderRadius: 6,
+                background: 'var(--bg)', border: '1px solid var(--border)',
+                fontSize: '11px', lineHeight: 1.7, fontFamily: 'var(--font-mono, monospace)',
+              }}>
+                pip install whisperx<br />
+                <span style={{ color: 'var(--text-muted)', fontFamily: 'var(--font-ui)' }}>
+                  安装后重启 PodCut 即可自动检测。需要 Python 3.8+ 和 PyTorch。
+                </span>
+              </div>
+            </details>
+          )}
+
           {/* Ollama 状态 */}
           {ollamaModel === 'checking' && (
             <div style={{ fontSize: '12px', color: 'var(--text-muted)' }}>检测本地模型…</div>
@@ -319,6 +438,7 @@ export default function Welcome() {
 
         <div style={{ marginTop: '20px', fontSize: '12px', color: 'var(--text-muted)' }}>
           不可计算 · 播客工作台
+          <span style={{ marginLeft: '8px', opacity: 0.5 }}>v{__APP_VERSION__}</span>
         </div>
       </div>
     </div>

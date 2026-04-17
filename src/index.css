@@ -1,9 +1,9 @@
+/* ─── Claude 品牌字体（@import 必须在最前）──────────────── */
+@import url('https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700&family=Lora:ital,wght@0,400;0,500;1,400&display=swap');
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
-
-/* ─── Claude 品牌字体 ──────────────────────────────────── */
-@import url('https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700&family=Lora:ital,wght@0,400;0,500;1,400&display=swap');
 
 /* ─── 设计令牌（Claude 品牌规范）────────────────────────── */
 :root {
@@ -35,14 +35,16 @@
   --red:        #b85450;
   --red-dim:    rgba(184,84,80,0.10);
 
-  /* 间距系统 */
+  /* 圆角系统 */
   --r-sm: 5px;
   --r:    8px;
+  --r-md: 10px;
   --r-lg: 14px;
 
   /* 字体 */
   --font-ui:   'Poppins', Arial, sans-serif;
   --font-body: 'Lora', Georgia, serif;
+  --font-mono: 'SF Mono', 'Fira Code', 'Consolas', monospace;
 }
 
 /* ─── 基础重置 ─────────────────────────────────────────── */

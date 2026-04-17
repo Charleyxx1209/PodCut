@@ -1,9 +1,24 @@
 import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
 import { assignSpeakers, markSilentChunks, type RawChunk, type SilenceRange } from '@/lib/speakers'
+import { mergeInterjections } from '@/lib/postProcess'
 import { fmt, cappedPush } from '@/lib/utils'
 
 // ─── 核心数据结构 ───────────────────────────────────────────────
+
+export interface Word {
+  text: string
+  start: number
+  end: number
+  deleted: boolean
+}
+
+export interface Interjection {
+  speakerId: string
+  start: number
+  end: number
+  text: string
+}
 
 export interface Chunk {
   id: string            // chunk_001, chunk_002 ...
@@ -11,6 +26,8 @@ export interface Chunk {
   speaker: string       // 说话人标签
   t_start: number       // 秒，对应原始音频时间戳
   t_end: number
+  words?: Word[]        // 词级时间戳（whisper --word-thold 输出）
+  interjections?: Interjection[]  // 主说话人发言期间的短插话（<=3s，不分段）
   section_id?: string   // LLM 归属章节（第二轮后填入）
   cut_status: 'keep' | 'discard' | 'maybe'
   cut_reason?: string
@@ -37,6 +54,7 @@ export interface MoveOp {
 export interface MusicTrack {
   type: 'intro' | 'outro'
   title: string       // e.g. "轻音乐 - 清晨"
+  path?: string       // 音频文件本地路径（Tauri 模式）
   duration: number    // 秒
   fadeIn: number      // 淡入时长（秒）
   fadeOut: number     // 淡出时长（秒）
@@ -72,12 +90,14 @@ export interface Project {
   sections: Section[]
   move_ops: MoveOp[]
   undo_stack: Chunk[][]
+  redo_stack: Chunk[][]
   stage: ProjectStage
   silences: SilenceRange[]           // 静音段列表，detect_silences 结果
   speakerNames: Record<string, string>  // id → 用户自定义显示名（覆盖调色板默认）
   // 精剪
   musicTracks: { intro?: MusicTrack; outro?: MusicTrack }
   beepMarks: BeepMark[]
+  sensitiveKeywords: string[]      // 敏感词列表（自动标注消音）
 }
 
 export type ProjectStage =
@@ -95,14 +115,17 @@ interface ProjectStore {
   project: Project | null
   _needsReanalysis: boolean   // 恢复会话时需要重跑 analysis（不持久化）
   createProject: (name: string, videoPath: string) => void
+  setProjectName: (name: string) => void
   setStage: (stage: ProjectStage) => void
   setChunks: (chunks: Chunk[]) => void
   setSections: (sections: Section[]) => void
   setChunkCutStatus: (id: string, status: 'keep' | 'discard' | 'maybe') => void
+  bulkSetCutStatus: (chunkIds: string[], status: 'keep' | 'discard' | 'maybe') => void
   confirmRoughCut: () => void
   backToRoughCut: () => void
   applyMoveOp: (op_id: string, status: 'accepted' | 'rejected' | 'custom', custom_index?: number) => void
   undoLastMove: () => void
+  redoLastMove: () => void
   exportMarkdown: () => string
   exportJSON: () => string
   reset: () => void
@@ -120,11 +143,16 @@ interface ProjectStore {
   beginAnalysis: (mergedChunks: Chunk[]) => void
   setAnalysisStatus: (msg: string) => void
   setAnalysisResult: (result: { sections: Section[]; chunks: Chunk[]; moveOps: MoveOp[] }) => void
+  // 词级删除
+  deleteWords: (chunkId: string, wordIndices: number[]) => void
+  restoreWords: (chunkId: string, wordIndices: number[]) => void
   // 精剪
   setMusicTrack: (track: MusicTrack) => void
   removeMusicTrack: (type: 'intro' | 'outro') => void
   addBeepMark: (mark: Omit<BeepMark, 'id'>) => void
   removeBeepMark: (id: string) => void
+  setSensitiveKeywords: (keywords: string[]) => void
+  autoMarkBeeps: () => number   // 根据敏感词自动标注，返回新增数量
   // 断点续传
   prepareForResume: () => void
   clearResumeFlag: () => void
@@ -151,13 +179,19 @@ export const useProjectStore = create<ProjectStore>()(
       sections: [],
       move_ops: [],
       undo_stack: [],
+      redo_stack: [],
       stage: 'idle',
       silences: [],
       speakerNames: {},
       musicTracks: {},
       beepMarks: [],
+      sensitiveKeywords: [],
     }
   }),
+
+  setProjectName: (name) => set(s => ({
+    project: s.project ? { ...s.project, name } : null
+  })),
 
   setStage: (stage) => set(s => ({
     project: s.project ? { ...s.project, stage } : null
@@ -181,6 +215,19 @@ export const useProjectStore = create<ProjectStore>()(
       chunks: s.project.chunks.map(c => c.id === id ? { ...c, cut_status: status } : c)
     } : null
   })),
+
+  bulkSetCutStatus: (chunkIds, status) => set(s => {
+    if (!s.project) return {}
+    const ids = new Set(chunkIds)
+    return {
+      project: {
+        ...s.project,
+        chunks: s.project.chunks.map(c => ids.has(c.id) ? { ...c, cut_status: status } : c),
+        undo_stack: cappedPush(s.project.undo_stack, s.project.chunks),
+        redo_stack: [],
+      }
+    }
+  }),
 
   confirmRoughCut: () => set(s => {
     if (!s.project) return {}
@@ -210,6 +257,7 @@ export const useProjectStore = create<ProjectStore>()(
         chunks_pre_edit: undefined,
         stage: 'rough_cut' as const,
         undo_stack: [],
+        redo_stack: [],
       }
     }
   }),
@@ -236,6 +284,7 @@ export const useProjectStore = create<ProjectStore>()(
         ...p,
         chunks: newChunks,
         undo_stack: cappedPush(p.undo_stack, snapshot),
+        redo_stack: [],   // 新编辑清空重做栈
         move_ops: p.move_ops.map(o => o.chunk_id === chunk_id ? { ...o, status } : o)
       }
     }
@@ -243,9 +292,30 @@ export const useProjectStore = create<ProjectStore>()(
 
   undoLastMove: () => set(s => {
     if (!s.project || s.project.undo_stack.length === 0) return {}
-    const stack = [...s.project.undo_stack]
-    const prev = stack.pop()!
-    return { project: { ...s.project, chunks: prev, undo_stack: stack } }
+    const undoStack = [...s.project.undo_stack]
+    const prev = undoStack.pop()!
+    return {
+      project: {
+        ...s.project,
+        chunks: prev,
+        undo_stack: undoStack,
+        redo_stack: cappedPush(s.project.redo_stack, s.project.chunks),
+      }
+    }
+  }),
+
+  redoLastMove: () => set(s => {
+    if (!s.project || s.project.redo_stack.length === 0) return {}
+    const redoStack = [...s.project.redo_stack]
+    const next = redoStack.pop()!
+    return {
+      project: {
+        ...s.project,
+        chunks: next,
+        undo_stack: cappedPush(s.project.undo_stack, s.project.chunks),
+        redo_stack: redoStack,
+      }
+    }
   }),
 
   // ── 流式转写 actions ──────────────────────────────
@@ -269,10 +339,12 @@ export const useProjectStore = create<ProjectStore>()(
     if (!s.project) return {}
     // 1. 按停顿分配说话人（s1 ↔ s2 交替）
     const withSpeakers = assignSpeakers(s.project.chunks_partial as RawChunk[]) as Chunk[]
-    // 2. 如果已有静音数据，立刻标记无声段
+    // 2. 合并短插话（≤3s 的夹心段不分段）
+    const merged = mergeInterjections(withSpeakers)
+    // 3. 如果已有静音数据，立刻标记无声段
     const done = s.project.silences.length > 0
-      ? markSilentChunks(withSpeakers as RawChunk[], s.project.silences) as Chunk[]
-      : withSpeakers
+      ? markSilentChunks(merged as RawChunk[], s.project.silences) as Chunk[]
+      : merged
     return {
       project: {
         ...s.project,
@@ -372,6 +444,36 @@ export const useProjectStore = create<ProjectStore>()(
       : null
   })),
 
+  deleteWords: (chunkId, wordIndices) => set(s => {
+    if (!s.project) return {}
+    const indexSet = new Set(wordIndices)
+    return {
+      project: {
+        ...s.project,
+        chunks: s.project.chunks.map(c =>
+          c.id === chunkId && c.words
+            ? { ...c, words: c.words.map((w, i) => indexSet.has(i) ? { ...w, deleted: true } : w) }
+            : c
+        ),
+      }
+    }
+  }),
+
+  restoreWords: (chunkId, wordIndices) => set(s => {
+    if (!s.project) return {}
+    const indexSet = new Set(wordIndices)
+    return {
+      project: {
+        ...s.project,
+        chunks: s.project.chunks.map(c =>
+          c.id === chunkId && c.words
+            ? { ...c, words: c.words.map((w, i) => indexSet.has(i) ? { ...w, deleted: false } : w) }
+            : c
+        ),
+      }
+    }
+  }),
+
   setMusicTrack: (track) => set(s => ({
     project: s.project ? {
       ...s.project,
@@ -398,6 +500,84 @@ export const useProjectStore = create<ProjectStore>()(
       beepMarks: s.project.beepMarks.filter(b => b.id !== id)
     } : null
   })),
+
+  setSensitiveKeywords: (keywords) => set(s => ({
+    project: s.project ? { ...s.project, sensitiveKeywords: keywords } : null
+  })),
+
+  autoMarkBeeps: () => {
+    const s = get()
+    if (!s.project) return 0
+    const p = s.project
+    const kws = p.sensitiveKeywords.filter(k => k.trim())
+    if (!kws.length) return 0
+
+    // 遍历所有 chunk 的 words，拼接文本后匹配敏感词 → 生成 beepMark
+    // 这样可以处理中文单字 word 拼成多字关键词的情况（如 "金"+"融" 匹配 "金融"）
+    const existingKeys = new Set(p.beepMarks.map(b => `${b.chunkId}:${b.tStart.toFixed(3)}`))
+    const newMarks: BeepMark[] = []
+    let counter = Date.now()
+
+    for (const chunk of p.chunks) {
+      if (!chunk.words || !chunk.words.length) continue
+
+      // 收集未删除的 word，构建拼接文本并记录每个字符对应的 word 下标
+      const activeWords: (Word & { idx: number })[] = []
+      for (let i = 0; i < chunk.words.length; i++) {
+        if (!chunk.words[i].deleted) activeWords.push({ ...chunk.words[i], idx: i })
+      }
+      if (!activeWords.length) continue
+
+      const chars: string[] = []
+      const charToActiveIdx: number[] = []   // chars[i] 对应 activeWords 中的下标
+      for (let wi = 0; wi < activeWords.length; wi++) {
+        for (const ch of activeWords[wi].text) {
+          chars.push(ch)
+          charToActiveIdx.push(wi)
+        }
+      }
+      const fullText = chars.join('').toLowerCase()
+
+      for (const kw of kws) {
+        const kwLower = kw.toLowerCase().trim()
+        if (!kwLower) continue
+        let searchFrom = 0
+        while (true) {
+          const pos = fullText.indexOf(kwLower, searchFrom)
+          if (pos === -1) break
+          searchFrom = pos + 1
+
+          // 映射匹配区间回 word 时间戳
+          const startAIdx = charToActiveIdx[pos]
+          const endAIdx   = charToActiveIdx[Math.min(pos + kwLower.length - 1, chars.length - 1)]
+          const startWord = activeWords[startAIdx]
+          const endWord   = activeWords[endAIdx]
+
+          const key = `${chunk.id}:${startWord.start.toFixed(3)}`
+          if (!existingKeys.has(key)) {
+            existingKeys.add(key)
+            newMarks.push({
+              id: `beep_${counter++}`,
+              chunkId: chunk.id,
+              text: kw,
+              tStart: startWord.start,
+              tEnd: endWord.end,
+            })
+          }
+        }
+      }
+    }
+
+    if (newMarks.length > 0) {
+      set(s => ({
+        project: s.project ? {
+          ...s.project,
+          beepMarks: [...s.project.beepMarks, ...newMarks],
+        } : null
+      }))
+    }
+    return newMarks.length
+  },
 
   // ── 真实流程后处理 ────────────────────────────────
 
@@ -464,7 +644,7 @@ export const useProjectStore = create<ProjectStore>()(
         stage: 'idle',
         chunks: [], chunks_original: [], chunks_partial: [],
         transcription_progress: 0,
-        sections: [], move_ops: [], undo_stack: [],
+        sections: [], move_ops: [], undo_stack: [], redo_stack: [],
       },
       _needsReanalysis: false,
     }
@@ -474,8 +654,37 @@ export const useProjectStore = create<ProjectStore>()(
   }),
   {
     name: 'podcut-project',
-    // 只持久化 project，运行时状态不存盘
-    partialize: (state) => ({ project: state.project }),
+    version: 3,  // bump when schema changes
+    // 只持久化 project（排除 undo/redo 栈，避免序列化 20×5000 条快照）
+    partialize: (state) => ({
+      project: state.project ? {
+        ...state.project,
+        undo_stack: [],
+        redo_stack: [],
+      } : null,
+    }),
+    // 迁移旧数据：补齐新字段，防止 undefined 崩溃
+    migrate: (persisted: any, _version: number) => {
+      const state = persisted as { project: any }
+      if (state.project) {
+        const p = state.project
+        // v0 → v1: 新增精剪相关字段
+        if (!p.musicTracks) p.musicTracks = {}
+        if (!p.beepMarks) p.beepMarks = []
+        if (!p.sensitiveKeywords) p.sensitiveKeywords = []
+        if (!p.speakerNames) p.speakerNames = {}
+        if (!p.silences) p.silences = []
+        if (!p.undo_stack) p.undo_stack = []
+        if (!p.redo_stack) p.redo_stack = []
+        if (!p.move_ops) p.move_ops = []
+        if (!p.chunks_partial) p.chunks_partial = []
+        if (!p.chunks_original) p.chunks_original = []
+        if (p.transcription_progress === undefined) p.transcription_progress = 0
+        if (p.total_duration_seconds === undefined) p.total_duration_seconds = 0
+        // v1 → v2: MusicTrack 新增 path 字段（可选，无需补）
+      }
+      return state
+    },
   }
 ))
 

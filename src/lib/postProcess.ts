@@ -6,7 +6,7 @@
  * Step 3: analyzeWithClaude — Qwen / Claude 生成章节 + 折返标注 + 丢弃建议
  */
 
-import type { Chunk, Section, MoveOp } from '@/store/project'
+import type { Chunk, Word, Interjection, Section, MoveOp } from '@/store/project'
 import { isTauri } from '@/lib/utils'
 
 // ── 常量 ─────────────────────────────────────────────────────────────
@@ -15,6 +15,7 @@ const MAX_CHUNK_SEC = 45    // 单句最长不超过此值（超过则断句）
 const DIARIZE_BATCH = 100   // 每批送给 Qwen 的段落数（降低以提升准确度）
 const DIARIZE_OVERLAP = 15  // 批次重叠段数（增大以保持上下文连贯）
 const MAX_SAME_SPEAKER_CHUNKS = 30  // 连续同 speaker 超过此数触发修正
+const INTERJECTION_MAX_SEC = 3  // 插话最长时长（秒），超过则正常分段
 
 // ── Step 1: 碎片合并 ─────────────────────────────────────────────────
 // 只做合并，不分说话人（speaker 暂设 "s0"，等 Step 2 覆盖）
@@ -23,20 +24,26 @@ export function mergeFragments(rawChunks: Chunk[]): Chunk[] {
 
   const merged: Chunk[] = []
   let parts: string[] = []
+  let words: Word[] = []
   let gId = '', gStart = 0, gEnd = 0
 
   function flush() {
     if (!parts.length) return
-    merged.push({
+    const chunk: Chunk = {
       id: gId, text: parts.join(' '),
       speaker: 's0', t_start: gStart, t_end: gEnd, cut_status: 'keep',
-    })
+    }
+    if (words.length > 0) chunk.words = words
+    merged.push(chunk)
     parts = []
+    words = []
   }
 
   for (const c of rawChunks) {
     if (!parts.length) {
-      gId = c.id; gStart = c.t_start; gEnd = c.t_end; parts = [c.text.trim()]
+      gId = c.id; gStart = c.t_start; gEnd = c.t_end
+      parts = [c.text.trim()]
+      words = c.words ? [...c.words] : []
       continue
     }
     const gap = c.t_start - gEnd
@@ -44,9 +51,12 @@ export function mergeFragments(rawChunks: Chunk[]): Chunk[] {
 
     if (gap <= MERGE_GAP_SEC && !tooLong) {
       gEnd = c.t_end; parts.push(c.text.trim())
+      if (c.words) words.push(...c.words)
     } else {
       flush()
-      gId = c.id; gStart = c.t_start; gEnd = c.t_end; parts = [c.text.trim()]
+      gId = c.id; gStart = c.t_start; gEnd = c.t_end
+      parts = [c.text.trim()]
+      words = c.words ? [...c.words] : []
     }
   }
   flush()
@@ -54,6 +64,91 @@ export function mergeFragments(rawChunks: Chunk[]): Chunk[] {
   return merged.map((c, i) => ({
     ...c, id: `chunk_${String(i + 1).padStart(4, '0')}`,
   }))
+}
+
+// ── Step 1.5: 插话合并 ──────────────────────────────────────────────
+// 规则：如果 Speaker B 在 Speaker A 连续发言期间插入 ≤3s 的短语（"嗯""对""是的"等），
+// 不打断 A 的段落，改为在 A 的 chunk 上挂 interjection 标记。
+export function mergeInterjections(chunks: Chunk[]): Chunk[] {
+  if (chunks.length < 3) return chunks
+
+  const result: Chunk[] = []
+  let i = 0
+
+  while (i < chunks.length) {
+    const curr = chunks[i]
+
+    // 看当前 chunk 是否是"夹心"插话：
+    // prev(A) → curr(B, ≤3s) → next(A)
+    if (i > 0 && i < chunks.length - 1) {
+      const prev = result[result.length - 1]
+      const next = chunks[i + 1]
+
+      if (
+        prev &&
+        prev.speaker !== curr.speaker &&
+        next.speaker === prev.speaker &&
+        (curr.t_end - curr.t_start) <= INTERJECTION_MAX_SEC
+      ) {
+        // 将 curr 作为 prev 的插话标记
+        const interjection: Interjection = {
+          speakerId: curr.speaker,
+          start: curr.t_start,
+          end: curr.t_end,
+          text: curr.text,
+        }
+        const updated = {
+          ...prev,
+          interjections: [...(prev.interjections ?? []), interjection],
+          // 扩展主段落的结束时间以覆盖插话
+          t_end: Math.max(prev.t_end, curr.t_end),
+        }
+        result[result.length - 1] = updated
+        i++
+        continue
+      }
+    }
+
+    result.push({ ...curr })
+    i++
+  }
+
+  return result
+}
+
+// ── WhisperX helper ──────────────────────────────────────────────────
+
+export async function detectWhisperX(): Promise<{ available: boolean; version?: string }> {
+  if (!isTauri()) return { available: false }
+  try {
+    const { invoke } = await import('@tauri-apps/api/core')
+    return await invoke<{ available: boolean; version?: string }>('check_whisperx')
+  } catch { return { available: false } }
+}
+
+/** 调用 WhisperX 做说话人分离，返回已标注 speaker 的 chunks */
+export async function diarizeWithWhisperX(
+  audioPath: string,
+  hfToken: string,
+  onStatus?: (msg: string) => void,
+): Promise<Chunk[]> {
+  if (!isTauri()) throw new Error('WhisperX 仅在桌面端可用')
+  const { invoke } = await import('@tauri-apps/api/core')
+
+  onStatus?.('WhisperX 说话人分离启动…')
+  const result = await invoke<{
+    chunks: Chunk[]
+    speaker_count: number
+    speaker_map: Array<[string, string]>
+  }>('diarize_whisperx', {
+    audioPath,
+    hfToken,
+  })
+
+  onStatus?.(`WhisperX 完成：${result.chunks.length} 段，${result.speaker_count} 位说话人`)
+
+  // 应用插话合并
+  return mergeInterjections(result.chunks)
 }
 
 // ── Ollama helper ────────────────────────────────────────────────────
@@ -223,7 +318,10 @@ ${lines}`
   // ── ④ 后处理：修正连续过长的单人片段
   // 如果同一 speaker 连续超过 MAX_SAME_SPEAKER_CHUNKS 段，
   // 在停顿最长的位置插入说话人切换
-  return fixLongRuns(result)
+  const fixed = fixLongRuns(result)
+
+  // ── ⑤ 插话合并：≤3s 短插话不分段
+  return mergeInterjections(fixed)
 }
 
 function fixLongRuns(chunks: Chunk[]): Chunk[] {

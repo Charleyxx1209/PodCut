@@ -320,34 +320,34 @@ interface TimeRange { start: number; end: number }
 
 ## 六、开发阶段规划
 
-### Phase 1（当前）·  核心链路稳定
+### Phase 1 ✅ · 核心链路稳定
 **目标**：能跑完一个完整的 60 分钟播客的粗剪流程
 
 - [x] 文件导入（拖拽）
 - [x] 音频提取（ffmpeg）
 - [x] Whisper 转写（流式，子进程，无崩溃）
 - [x] 模型下载（蓝色进度条，非报错）
-- [ ] **修复 Release 崩溃**：移除 `panic = "abort"`，加 panic hook（进行中）
-- [ ] 静音检测（ffmpeg silencedetect）
-- [ ] 基础 Speaker 分配（静音分割启发式）
-- [ ] 章节分段（LLM，Ollama 优先）
-- [ ] 对话条目删除/恢复
-- [ ] 播放器联动（点文字跳时间轴）
-- [ ] 工程文件保存/加载
+- [x] 修复 Release 崩溃：移除 `panic = "abort"`，改为默认 unwind + panic hook
+- [x] 静音检测（ffmpeg silencedetect）
+- [x] 基础 Speaker 分配（静音分割启发式）
+- [x] 章节分段（LLM，Ollama/Claude）
+- [x] 对话条目删除/恢复
+- [x] 播放器联动（粗剪 + 精剪，点文字跳时间轴）
+- [x] 工程文件保存/加载（Zustand persist）
 
-### Phase 2 · 粗剪完整体验
-- [ ] WhisperX Speaker 识别（安装引导）
-- [ ] 插话合并（≤3s 短插话不分段）
-- [ ] 折返内容检测（LLM）
-- [ ] 词语级删除
-- [ ] 拖拽重排（章节 + 对话条目）
-- [ ] 小宇宙 RSS 发布
+### Phase 2 ✅ · 粗剪完整体验
+- [x] WhisperX Speaker 识别（安装引导）
+- [x] 插话合并（≤3s 短插话不分段）
+- [x] 折返内容检测（LLM）
+- [x] 词语级删除
+- [x] 拖拽重排（章节 + 对话条目，dnd-kit）
+- [x] 小宇宙 RSS 发布（RSS 2.0 XML 生成 + 章节标记）
 
-### Phase 3 · 精剪
-- [ ] 多轨道波形（WaveSurfer multitrack）
-- [ ] 配乐 + 淡入淡出 + Ducking
-- [ ] 敏感词哔音替换
-- [ ] 音频导出（多格式）
+### Phase 3 ✅ · 精剪
+- [x] 多轨道波形（Canvas 多 speaker 轨道 + 静音可视化）
+- [x] 配乐 + 淡入淡出（片头/片尾曲，ducking 参数）
+- [x] 敏感词哔音替换（beepMarks）
+- [x] 音频导出（MP3/AAC/WAV/FLAC，ffmpeg filter_complex/concat）
 
 ### Phase 4 · Web SaaS
 - [ ] 引擎适配层（AssemblyAI 接入）

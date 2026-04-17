@@ -363,6 +363,335 @@ async fn split_audio_track(
     else { Err(format!("ffmpeg 退出码: {:?}", status.code())) }
 }
 
+// ─── 音频导出（合并保留片段 + 音乐 + beep → 目标格式）────────────────
+// 多阶段管线：
+//   1) concat 保留片段 → speech.wav
+//   2) 叠加 beep 音（静音原始段 + 1kHz sine）→ beeped.wav
+//   3) 拼接 intro（fade-in）+ speech + outro（fade-out）→ final output
+#[tauri::command]
+async fn export_audio(
+    app: tauri::AppHandle,
+    input_path: String,
+    segments: Vec<[f64; 2]>,
+    format: String,
+    quality: String,
+    output_path: String,
+    // 可选：音乐轨
+    intro_path: Option<String>,
+    intro_fade_in: Option<f64>,
+    intro_fade_out: Option<f64>,
+    outro_path: Option<String>,
+    outro_fade_in: Option<f64>,
+    outro_fade_out: Option<f64>,
+    // 可选：beep 标记（[t_start, t_end]，相对于 concat 后的时间线）
+    beep_ranges: Option<Vec<[f64; 2]>>,
+    // 可选：元数据嵌入
+    meta_title: Option<String>,
+    meta_artist: Option<String>,
+    meta_album: Option<String>,
+    // 可选：章节标记 [{title, start_ms, end_ms}]
+    chapters: Option<Vec<serde_json::Value>>,
+) -> Result<String, String> {
+    let ffmpeg = find_ffmpeg();
+    plog!("export_audio: {} segments, format={}, quality={}, intro={}, outro={}, beeps={} → {}",
+        segments.len(), format, quality,
+        intro_path.is_some(), outro_path.is_some(),
+        beep_ranges.as_ref().map(|b| b.len()).unwrap_or(0),
+        output_path);
+
+    if segments.is_empty() {
+        return Err("没有保留的片段可导出".into());
+    }
+
+    let tmp_dir = std::env::temp_dir().join(format!("podcut_export_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&tmp_dir);
+    let total_segments = segments.len();
+
+    // 构建 codec 参数
+    let codec_args: Vec<String> = match format.as_str() {
+        "mp3" => {
+            let kbps = parse_kbps(&quality);
+            vec!["-codec:a".into(), "libmp3lame".into(), "-b:a".into(), format!("{}k", kbps)]
+        }
+        "aac" => {
+            let kbps = parse_kbps(&quality);
+            vec!["-codec:a".into(), "aac".into(), "-b:a".into(), format!("{}k", kbps)]
+        }
+        "wav" => {
+            if quality.contains("24-bit") {
+                vec!["-codec:a".into(), "pcm_s24le".into(), "-ar".into(), "48000".into()]
+            } else {
+                vec!["-codec:a".into(), "pcm_s16le".into(), "-ar".into(), "44100".into()]
+            }
+        }
+        "flac" => {
+            let ar = if quality.contains("48") { "48000" } else { "44100" };
+            vec!["-codec:a".into(), "flac".into(), "-ar".into(), ar.into()]
+        }
+        _ => return Err(format!("不支持的格式: {format}")),
+    };
+
+    // ── 第1步：concat 保留片段 → speech.wav ──
+    let speech_wav = tmp_dir.join("speech.wav");
+    let speech_str = speech_wav.to_string_lossy().to_string();
+
+    let _ = app.emit("export_progress", serde_json::json!({ "pct": 5, "msg": "合并对话片段…" }));
+
+    // 按批次合并：每批 100 段用 filter_complex，超过则分批 + concat demuxer
+    const BATCH: usize = 100;
+    if total_segments <= BATCH {
+        // 单次 filter_complex
+        let mut filter_parts: Vec<String> = Vec::new();
+        let mut concat_inputs: Vec<String> = Vec::new();
+        for (i, [s, e]) in segments.iter().enumerate() {
+            filter_parts.push(format!("[0:a]atrim=start={s:.3}:end={e:.3},asetpts=N/SR/TB[a{i}]"));
+            concat_inputs.push(format!("[a{i}]"));
+        }
+        let concat_str = concat_inputs.join("");
+        let filter = format!(
+            "{};{}concat=n={total_segments}:v=0:a=1[out]",
+            filter_parts.join(";"), concat_str
+        );
+        let out = Command::new(&ffmpeg)
+            .args(["-i", &input_path, "-filter_complex", &filter, "-map", "[out]",
+                   "-acodec", "pcm_s16le", "-ar", "44100", "-ac", "1", "-y", &speech_str])
+            .stderr(Stdio::piped()).stdout(Stdio::piped()).output()
+            .map_err(|e| format!("ffmpeg concat 失败: {e}"))?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            return Err(format!("ffmpeg concat 失败: {}", trunc(&stderr, 300)));
+        }
+    } else {
+        // 分批：每批 BATCH 段 → batch_NNN.wav → concat demuxer 合并
+        // 比逐段切割快 50-100 倍（5000 段仅需 ~50 次 ffmpeg 而非 5000 次）
+        let mut batch_files: Vec<String> = Vec::new();
+        for (batch_idx, batch) in segments.chunks(BATCH).enumerate() {
+            let batch_path = tmp_dir.join(format!("batch_{batch_idx:03}.wav"));
+            let batch_str = batch_path.to_string_lossy().to_string();
+            let n = batch.len();
+            let mut filter_parts: Vec<String> = Vec::new();
+            let mut concat_inputs: Vec<String> = Vec::new();
+            for (i, [s, e]) in batch.iter().enumerate() {
+                filter_parts.push(format!("[0:a]atrim=start={s:.3}:end={e:.3},asetpts=N/SR/TB[a{i}]"));
+                concat_inputs.push(format!("[a{i}]"));
+            }
+            let filter = format!("{};{}concat=n={n}:v=0:a=1[out]",
+                filter_parts.join(";"), concat_inputs.join(""));
+            let out = Command::new(&ffmpeg)
+                .args(["-i", &input_path, "-filter_complex", &filter, "-map", "[out]",
+                       "-acodec", "pcm_s16le", "-ar", "44100", "-ac", "1", "-y", &batch_str])
+                .stderr(Stdio::piped()).stdout(Stdio::piped()).output()
+                .map_err(|e| format!("ffmpeg batch {batch_idx}: {e}"))?;
+            if !out.status.success() {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                return Err(format!("ffmpeg 批次 {batch_idx} 失败: {}", trunc(&stderr, 300)));
+            }
+            batch_files.push(batch_str);
+            let pct = 5 + ((batch_idx + 1) * BATCH * 30 / total_segments).min(30);
+            let _ = app.emit("export_progress", serde_json::json!({ "pct": pct, "msg": format!("合并批次 {}/{}", batch_idx+1, (total_segments + BATCH - 1) / BATCH) }));
+        }
+        // concat demuxer 合并所有批次
+        let list_lines: Vec<String> = batch_files.iter().map(|p| format!("file '{p}'")).collect();
+        let list_path = tmp_dir.join("concat_list.txt");
+        std::fs::write(&list_path, list_lines.join("\n")).map_err(|e| format!("{e}"))?;
+        let out = Command::new(&ffmpeg)
+            .args(["-f", "concat", "-safe", "0", "-i", &list_path.to_string_lossy(),
+                   "-acodec", "pcm_s16le", "-ar", "44100", "-ac", "1", "-y", &speech_str])
+            .stderr(Stdio::piped()).stdout(Stdio::piped()).output()
+            .map_err(|e| format!("ffmpeg concat 失败: {e}"))?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            return Err(format!("ffmpeg concat 失败: {}", trunc(&stderr, 300)));
+        }
+    }
+
+    // beep 范围预处理（后续合并到最终编码步骤，减少一次完整 PCM 读写）
+    let beeps = beep_ranges.unwrap_or_default();
+    // 构建 beep 滤镜片段（在最终编码时注入，不再生成中间 beeped.wav）
+    let beep_filter_expr: Option<String> = if !beeps.is_empty() {
+        let _ = app.emit("export_progress", serde_json::json!({ "pct": 45, "msg": format!("准备 {} 处消音…", beeps.len()) }));
+        let mute_expr: String = beeps.iter()
+            .map(|[s, e]| format!("between(t,{s:.3},{e:.3})"))
+            .collect::<Vec<_>>().join("+");
+        // speech → mute → amix with sine → [beeped]
+        Some(format!(
+            "[{{IN}}]volume=enable='{mute_expr}':volume=0[_muted];\
+             sine=f=1000:sample_rate=44100,aformat=sample_fmts=s16:channel_layouts=mono[_beep];\
+             [_beep]volume=enable='{mute_expr}':volume=0.3[_beep_g];\
+             [_muted][_beep_g]amix=inputs=2:duration=first[_beeped]"))
+    } else {
+        None
+    };
+
+    // ── 第2.5步：生成 ffmetadata 文件（元数据 + 章节标记）──
+    let ffmeta_path = tmp_dir.join("ffmetadata.txt");
+    let has_meta = meta_title.is_some() || meta_artist.is_some() || meta_album.is_some()
+        || chapters.as_ref().map(|c| !c.is_empty()).unwrap_or(false);
+    if has_meta {
+        let mut meta = String::from(";FFMETADATA1\n");
+        if let Some(ref t) = meta_title  { meta.push_str(&format!("title={}\n", t.replace('\n', " "))); }
+        if let Some(ref a) = meta_artist { meta.push_str(&format!("artist={}\n", a.replace('\n', " "))); }
+        if let Some(ref al) = meta_album { meta.push_str(&format!("album={}\n", al.replace('\n', " "))); }
+        // 章节标记
+        if let Some(ref chaps) = chapters {
+            for ch in chaps {
+                let title = ch.get("title").and_then(|v| v.as_str()).unwrap_or("Chapter");
+                let start_ms = ch.get("start_ms").and_then(|v| v.as_i64()).unwrap_or(0);
+                let end_ms = ch.get("end_ms").and_then(|v| v.as_i64()).unwrap_or(start_ms + 1000);
+                meta.push_str(&format!(
+                    "\n[CHAPTER]\nTIMEBASE=1/1000\nSTART={}\nEND={}\ntitle={}\n",
+                    start_ms, end_ms, title.replace('\n', " ")
+                ));
+            }
+        }
+        std::fs::write(&ffmeta_path, &meta).map_err(|e| format!("写入 ffmetadata 失败: {e}"))?;
+        plog!("export_audio: ffmetadata written ({} bytes)", meta.len());
+    }
+
+    // ── 最终步：beep + intro/outro + 编码 → 单次 ffmpeg 输出（省去中间 beeped.wav）──
+    let has_intro = intro_path.as_ref().map(|p| !p.is_empty() && std::path::Path::new(p).exists()).unwrap_or(false);
+    let has_outro = outro_path.as_ref().map(|p| !p.is_empty() && std::path::Path::new(p).exists()).unwrap_or(false);
+    let has_beep = beep_filter_expr.is_some();
+
+    {
+        let _ = app.emit("export_progress", serde_json::json!({ "pct": 60, "msg": "编码输出…" }));
+
+        let mut input_args: Vec<String> = Vec::new();
+        let mut filter_parts: Vec<String> = Vec::new();
+        let mut concat_labels: Vec<String> = Vec::new();
+        let mut input_idx: usize = 0;
+
+        // Intro
+        if has_intro {
+            let intro = intro_path.as_ref().unwrap();
+            input_args.extend(["-i".into(), intro.clone()]);
+            let fi = intro_fade_in.unwrap_or(3.0);
+            let fo = intro_fade_out.unwrap_or(0.0);
+            let mut f = format!("[{input_idx}:a]");
+            if fi > 0.0 { f.push_str(&format!("afade=t=in:st=0:d={fi:.1},")); }
+            if fo > 0.0 {
+                let dur = get_file_duration(&ffmpeg, intro).unwrap_or(30.0);
+                f.push_str(&format!("afade=t=out:st={:.1}:d={fo:.1},", dur - fo));
+            }
+            f.push_str("aformat=sample_fmts=s16:sample_rates=44100:channel_layouts=mono[intro]");
+            filter_parts.push(f);
+            concat_labels.push("[intro]".into());
+            input_idx += 1;
+        }
+
+        // Speech 输入
+        input_args.extend(["-i".into(), speech_str.clone()]);
+        let speech_label = format!("{input_idx}:a");
+
+        // 如果有 beep，内联 beep 滤镜；否则直接格式化
+        if let Some(ref beep_tmpl) = beep_filter_expr {
+            let beep_filter = beep_tmpl.replace("{IN}", &speech_label);
+            filter_parts.push(beep_filter);
+            filter_parts.push("[_beeped]aformat=sample_fmts=s16:sample_rates=44100:channel_layouts=mono[speech]".into());
+        } else {
+            filter_parts.push(format!("[{speech_label}]aformat=sample_fmts=s16:sample_rates=44100:channel_layouts=mono[speech]"));
+        }
+        concat_labels.push("[speech]".into());
+        input_idx += 1;
+
+        // Outro
+        if has_outro {
+            let outro = outro_path.as_ref().unwrap();
+            input_args.extend(["-i".into(), outro.clone()]);
+            let fi = outro_fade_in.unwrap_or(0.0);
+            let fo = outro_fade_out.unwrap_or(5.0);
+            let mut f = format!("[{input_idx}:a]");
+            if fi > 0.0 { f.push_str(&format!("afade=t=in:st=0:d={fi:.1},")); }
+            if fo > 0.0 {
+                let dur = get_file_duration(&ffmpeg, outro).unwrap_or(30.0);
+                f.push_str(&format!("afade=t=out:st={:.1}:d={fo:.1},", dur - fo));
+            }
+            f.push_str("aformat=sample_fmts=s16:sample_rates=44100:channel_layouts=mono[outro]");
+            filter_parts.push(f);
+            concat_labels.push("[outro]".into());
+            input_idx += 1;
+        }
+
+        // 是否需要 filter_complex
+        let needs_filter = has_beep || has_intro || has_outro;
+        let mut args = input_args;
+
+        if needs_filter {
+            // concat 多个音轨（或仅 beep 处理后的 speech）
+            if concat_labels.len() > 1 {
+                let n = concat_labels.len();
+                let labels = concat_labels.join("");
+                filter_parts.push(format!("{labels}concat=n={n}:v=0:a=1[out]"));
+            } else {
+                // 仅 speech（可能含 beep 滤镜），重命名输出标签
+                filter_parts.push("[speech]anull[out]".into());
+            }
+            let filter = filter_parts.join(";");
+            args.extend(["-filter_complex".into(), filter, "-map".into(), "[out]".into()]);
+        }
+
+        // 注入 metadata 文件
+        if has_meta {
+            args.extend(["-i".into(), ffmeta_path.to_string_lossy().into_owned()]);
+            args.extend(["-map_metadata".into(), format!("{}", input_idx)]);
+        }
+        args.extend(codec_args.clone());
+        args.extend(["-y".into(), output_path.clone()]);
+
+        let _ = app.emit("export_progress", serde_json::json!({ "pct": 75, "msg": "编码输出…" }));
+
+        let out = Command::new(&ffmpeg)
+            .args(&args)
+            .stderr(Stdio::piped()).stdout(Stdio::piped()).output()
+            .map_err(|e| format!("ffmpeg final 失败: {e}"))?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            plog!("export_audio final FAILED: {}", trunc(&stderr, 500));
+            return Err(format!("ffmpeg 最终编码失败: {}", trunc(&stderr, 300)));
+        }
+    }
+
+    // 清理临时文件
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+
+    let file_size = std::fs::metadata(&output_path).map(|m| m.len()).unwrap_or(0);
+    let _ = app.emit("export_progress", serde_json::json!({ "pct": 100, "msg": "导出完成" }));
+    plog!("export_audio: done, size={}KB", file_size / 1024);
+
+    Ok(serde_json::json!({ "path": output_path, "size": file_size }).to_string())
+}
+
+/// 获取音频文件时长（复用 ffmpeg Duration 解析逻辑）
+fn get_file_duration(ffmpeg: &str, path: &str) -> Result<f64, String> {
+    let out = Command::new(ffmpeg)
+        .args(["-i", path])
+        .stderr(Stdio::piped()).stdout(Stdio::null()).output()
+        .map_err(|e| format!("{e}"))?;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    for line in stderr.lines() {
+        if let Some(pos) = line.find("Duration:") {
+            let rest = &line[pos + 9..];
+            let ts = rest.trim_start().splitn(2, ',').next().unwrap_or("").trim();
+            let parts: Vec<&str> = ts.split(':').collect();
+            if parts.len() == 3 {
+                let h: f64 = parts[0].parse().unwrap_or(0.0);
+                let m: f64 = parts[1].parse().unwrap_or(0.0);
+                let s: f64 = parts[2].parse().unwrap_or(0.0);
+                return Ok(h * 3600.0 + m * 60.0 + s);
+            }
+        }
+    }
+    Err("Duration 未找到".into())
+}
+
+/// 从 "256 kbps" 等字符串中解析比特率数值
+fn parse_kbps(s: &str) -> u32 {
+    s.split_whitespace()
+        .next()
+        .and_then(|n| n.parse::<u32>().ok())
+        .unwrap_or(192)
+}
+
 // ─── 获取时长 ─────────────────────────────────────────────────────────
 #[tauri::command]
 async fn get_audio_duration(path: String) -> Result<f64, String> {
@@ -492,7 +821,23 @@ fn parse_timestamp_ms(s: &str) -> f64 {
     }
 }
 
-fn parse_whisper_json(json_path: &str) -> Result<Vec<(f64, f64, String)>, String> {
+/// 单个词的时间戳
+#[derive(serde::Serialize, Clone)]
+struct WordToken {
+    text: String,
+    start: f64,
+    end: f64,
+}
+
+/// 一段转写结果（含词级时间戳）
+struct WhisperSegment {
+    t0: f64,
+    t1: f64,
+    text: String,
+    words: Vec<WordToken>,
+}
+
+fn parse_whisper_json(json_path: &str) -> Result<Vec<WhisperSegment>, String> {
     let data = std::fs::read_to_string(json_path)
         .map_err(|e| format!("读取 JSON 失败 ({json_path}): {e}"))?;
     let v: serde_json::Value = serde_json::from_str(&data)
@@ -507,7 +852,22 @@ fn parse_whisper_json(json_path: &str) -> Result<Vec<(f64, f64, String)>, String
             .and_then(|s| s.as_str()).map(parse_timestamp_ms).unwrap_or(0.0);
         let t1 = item.get("timestamps").and_then(|ts| ts.get("to"))
             .and_then(|s| s.as_str()).map(parse_timestamp_ms).unwrap_or(t0);
-        result.push((t0, t1, text));
+        // 解析词级 tokens（whisper-cli JSON 中 tokens 数组）
+        let words = item.get("tokens").and_then(|t| t.as_array())
+            .map(|tokens| {
+                tokens.iter().filter_map(|tok| {
+                    let w = tok.get("text").and_then(|t| t.as_str())?.trim().to_string();
+                    if w.is_empty() { return None; }
+                    // 跳过特殊 token（[_BEG_] 等）
+                    if w.starts_with('[') && w.ends_with(']') { return None; }
+                    let ws = tok.get("timestamps").and_then(|ts| ts.get("from"))
+                        .and_then(|s| s.as_str()).map(parse_timestamp_ms).unwrap_or(t0);
+                    let we = tok.get("timestamps").and_then(|ts| ts.get("to"))
+                        .and_then(|s| s.as_str()).map(parse_timestamp_ms).unwrap_or(t1);
+                    Some(WordToken { text: w, start: ws, end: we })
+                }).collect()
+            }).unwrap_or_default();
+        result.push(WhisperSegment { t0, t1, text, words });
     }
     plog!("parse_whisper_json: {} segments from {}", result.len(), json_path);
     Ok(result)
@@ -765,19 +1125,30 @@ async fn transcribe_streaming(
             }
             Ok(segs) => {
                 plog!("segment {}/{}: {} chunks parsed", seg_idx + 1, segment_count, segs.len());
-                for (t0_rel, t1_rel, text) in segs {
-                    let text = text.trim().to_string();
+                for seg in segs {
+                    let text = seg.text.trim().to_string();
                     if text.is_empty() { continue; }
                     chunk_counter += 1;
-                    plog!("  chunk #{}: [{:.1}–{:.1}s] {}", chunk_counter,
-                        t0_rel + start, t1_rel + start, trunc(&text, 50));
+                    plog!("  chunk #{}: [{:.1}–{:.1}s] {} words, {}",
+                        chunk_counter, seg.t0 + start, seg.t1 + start,
+                        seg.words.len(), trunc(&text, 50));
+                    // 修正词级时间戳：加上段起始偏移
+                    let words: Vec<serde_json::Value> = seg.words.iter().map(|w| {
+                        serde_json::json!({
+                            "text": w.text,
+                            "start": w.start + start,
+                            "end": w.end + start,
+                            "deleted": false,
+                        })
+                    }).collect();
                     let _ = app.emit("transcription_chunk", serde_json::json!({
                         "id": format!("chunk_{chunk_counter:04}"),
                         "text": text,
                         "speaker": "s1",           // 初始占位，finalizeTranscription 时 assignSpeakers 重新分配
-                        "t_start": t0_rel + start,
-                        "t_end":   t1_rel + start,
-                        "cut_status": "keep"
+                        "t_start": seg.t0 + start,
+                        "t_end":   seg.t1 + start,
+                        "cut_status": "keep",
+                        "words": words,
                     }));
                 }
             }
@@ -870,6 +1241,173 @@ async fn check_ollama() -> Result<bool, String> {
     Ok(reqwest::get("http://localhost:11434/api/tags").await.is_ok())
 }
 
+// ─── WhisperX 状态检查 ────────────────────────────────────────────────
+// 检查 python3 + whisperx 包是否可用
+#[tauri::command]
+async fn check_whisperx() -> Result<serde_json::Value, String> {
+    let out = Command::new("python3")
+        .args(["-c", "import whisperx; print(whisperx.__version__)"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output();
+    match out {
+        Ok(o) if o.status.success() => {
+            let ver = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            plog!("whisperx: found version {}", ver);
+            Ok(serde_json::json!({ "available": true, "version": ver }))
+        }
+        _ => {
+            plog!("whisperx: not found");
+            Ok(serde_json::json!({ "available": false }))
+        }
+    }
+}
+
+// ─── WhisperX 说话人分离 ──────────────────────────────────────────────
+// 调用 whisperx CLI 对音频做说话人标注，返回带 speaker 的段落
+#[tauri::command]
+async fn diarize_whisperx(
+    audio_path: String,
+    hf_token: String,
+    model: Option<String>,
+    app: tauri::AppHandle,
+) -> Result<serde_json::Value, String> {
+    let model_name = model.unwrap_or_else(|| "large-v2".into());
+    plog!("diarize_whisperx: audio={} model={}", audio_path, model_name);
+
+    let _ = app.emit("whisperx_status", serde_json::json!({
+        "stage": "starting", "message": "WhisperX 说话人分离启动…"
+    }));
+
+    // 输出到临时目录
+    let tmp_dir = std::env::temp_dir().join("podcut_whisperx");
+    let _ = std::fs::create_dir_all(&tmp_dir);
+
+    let mut cmd = Command::new("python3");
+    cmd.args([
+        "-m", "whisperx",
+        &audio_path,
+        "--model", &model_name,
+        "--diarize",
+        "--hf_token", &hf_token,
+        "--output_format", "json",
+        "--output_dir", &tmp_dir.to_string_lossy(),
+        "--language", "zh",
+    ]);
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    plog!("diarize_whisperx: running command");
+    let _ = app.emit("whisperx_status", serde_json::json!({
+        "stage": "processing", "message": "WhisperX 处理中（可能需要几分钟）…"
+    }));
+
+    let output = cmd.output()
+        .map_err(|e| format!("WhisperX 启动失败: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        plog!("diarize_whisperx FAILED: {}", trunc(&stderr, 500));
+        return Err(format!("WhisperX 失败: {}", trunc(&stderr, 300)));
+    }
+
+    // 查找输出 JSON 文件
+    let audio_stem = std::path::Path::new(&audio_path)
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "audio".into());
+    let json_path = tmp_dir.join(format!("{}.json", audio_stem));
+
+    if !json_path.exists() {
+        // 尝试查找任何 .json 文件
+        let found = std::fs::read_dir(&tmp_dir)
+            .map_err(|e| format!("读取输出目录失败: {e}"))?
+            .filter_map(|e| e.ok())
+            .find(|e| e.path().extension().map(|x| x == "json").unwrap_or(false));
+        if let Some(f) = found {
+            return parse_whisperx_json(&f.path(), &app);
+        }
+        return Err("WhisperX 输出文件未找到".into());
+    }
+
+    parse_whisperx_json(&json_path, &app)
+}
+
+fn parse_whisperx_json(
+    path: &std::path::Path,
+    app: &tauri::AppHandle,
+) -> Result<serde_json::Value, String> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| format!("读取 WhisperX JSON 失败: {e}"))?;
+    let json: serde_json::Value = serde_json::from_str(&content)
+        .map_err(|e| format!("解析 WhisperX JSON 失败: {e}"))?;
+
+    // WhisperX JSON 格式: { "segments": [{ "start", "end", "text", "speaker", "words": [...] }] }
+    let segments = json.get("segments")
+        .and_then(|s| s.as_array())
+        .ok_or("WhisperX JSON 缺少 segments 数组")?;
+
+    let mut chunks: Vec<serde_json::Value> = Vec::new();
+    // 建立 speaker 映射：WhisperX 输出 SPEAKER_00, SPEAKER_01... → s1, s2...
+    let mut speaker_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut next_speaker_idx = 1u32;
+
+    for (i, seg) in segments.iter().enumerate() {
+        let text = seg.get("text").and_then(|t| t.as_str()).unwrap_or("").trim().to_string();
+        if text.is_empty() { continue; }
+
+        let start = seg.get("start").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let end = seg.get("end").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let raw_speaker = seg.get("speaker").and_then(|v| v.as_str()).unwrap_or("SPEAKER_00").to_string();
+
+        let speaker = speaker_map.entry(raw_speaker.clone()).or_insert_with(|| {
+            let s = format!("s{}", next_speaker_idx);
+            next_speaker_idx += 1;
+            s
+        }).clone();
+
+        // 解析词级时间戳
+        let words: Vec<serde_json::Value> = seg.get("words")
+            .and_then(|w| w.as_array())
+            .map(|arr| arr.iter().filter_map(|w| {
+                let wtext = w.get("word").and_then(|v| v.as_str())?;
+                let ws = w.get("start").and_then(|v| v.as_f64()).unwrap_or(start);
+                let we = w.get("end").and_then(|v| v.as_f64()).unwrap_or(end);
+                Some(serde_json::json!({
+                    "text": wtext.trim(),
+                    "start": ws,
+                    "end": we,
+                    "deleted": false,
+                }))
+            }).collect())
+            .unwrap_or_default();
+
+        chunks.push(serde_json::json!({
+            "id": format!("chunk_{:04}", i + 1),
+            "text": text,
+            "speaker": speaker,
+            "t_start": start,
+            "t_end": end,
+            "cut_status": "keep",
+            "words": words,
+        }));
+    }
+
+    plog!("parse_whisperx_json: {} chunks, {} speakers", chunks.len(), speaker_map.len());
+    let _ = app.emit("whisperx_status", serde_json::json!({
+        "stage": "done",
+        "message": format!("WhisperX 完成：{} 段，{} 位说话人", chunks.len(), speaker_map.len())
+    }));
+
+    // 清理临时文件
+    let _ = std::fs::remove_file(path);
+
+    Ok(serde_json::json!({
+        "chunks": chunks,
+        "speaker_count": speaker_map.len(),
+        "speaker_map": speaker_map.into_iter().collect::<Vec<_>>(),
+    }))
+}
+
 // ─── Claude API 代理（绕过 WebView CORS 限制） ────────────────────────
 #[tauri::command]
 async fn call_claude_api(api_key: String, body_json: String) -> Result<String, String> {
@@ -927,9 +1465,12 @@ pub fn run() {
             download_model,
             detect_silences,
             split_audio_track,
+            export_audio,
             diagnose_env,
             transcribe_streaming,
             check_ollama,
+            check_whisperx,
+            diarize_whisperx,
             call_claude_api,
         ])
         .run(tauri::generate_context!())

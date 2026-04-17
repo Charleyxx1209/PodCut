@@ -7,22 +7,36 @@ import ChapterNav from './ChapterNav'
 import AppIcon from './AppIcon'
 import ProcessingView from './ProcessingView'
 import ExportPanel from './ExportPanel'
-import { mergeFragments, diarizeWithOllama, analyzeWithClaude, detectOllama } from '@/lib/postProcess'
+import { mergeFragments, diarizeWithOllama, diarizeWithWhisperX, analyzeWithClaude, detectOllama, detectWhisperX } from '@/lib/postProcess'
 import { markSilentChunks, type RawChunk } from '@/lib/speakers'
 import { isTauri } from '@/lib/utils'
+import { saveProjectFile, loadProjectFile } from '@/lib/projectFile'
 
 // ── Mock 数据（DEV 流式演示用）────────────────────────────────────────
+// 辅助：为 mock 文本生成均匀分布的词级时间戳
+function mockWords(text: string, tStart: number, tEnd: number) {
+  // 中文按字切分（每个字视为一个 "word"）
+  const chars = text.split('')
+  const dur = tEnd - tStart
+  return chars.map((ch, i) => ({
+    text: ch,
+    start: tStart + (i / chars.length) * dur,
+    end: tStart + ((i + 1) / chars.length) * dur,
+    deleted: false,
+  }))
+}
+
 const MOCK_CHUNKS: Chunk[] = [
-  { id: 'chunk_001', text: '好，我们今天聊聊AI时代通识教育的困境，很多人学的东西正在被模型替代。', speaker: 's1', t_start: 0,   t_end: 12,  cut_status: 'keep', section_id: 'sec_ai' },
-  { id: 'chunk_002', text: '对，我觉得现在大学里教的很多技能，比如写报告、做数据分析，GPT都能做得比人好。', speaker: 's2', t_start: 14,  t_end: 29,  cut_status: 'keep', section_id: 'sec_ai' },
-  { id: 'chunk_003', text: '那你觉得什么样的技能是真正不可替代的？边缘的、小众的那种？', speaker: 's1', t_start: 31,  t_end: 40,  cut_status: 'keep', section_id: 'sec_ai' },
-  { id: 'chunk_004', text: '我认识一个修古董钟表的人，他的手艺需要二十年积累，AI完全没办法复制那种触感判断。', speaker: 's2', t_start: 42,  t_end: 58,  cut_status: 'keep', section_id: 'sec_ai' },
-  { id: 'chunk_005', text: '这让我想到你当初的决策——你是怎么走上现在这条路的？', speaker: 's1', t_start: 60,  t_end: 69,  cut_status: 'keep', section_id: 'sec_path' },
-  { id: 'chunk_006', text: '其实我大学学的是金融，但第三年突然觉得那条路太可预测了，就去学了焊接。', speaker: 's2', t_start: 71,  t_end: 87,  cut_status: 'keep', section_id: 'sec_path' },
-  { id: 'chunk_007', text: '说回AI替代这个话题，我觉得最危险的不是体力劳动，而是那种中等复杂度的脑力工作。', speaker: 's2', t_start: 88,  t_end: 103, cut_status: 'keep', section_id: 'sec_path' },
-  { id: 'chunk_008', text: '所有人都觉得我疯了，但我觉得那是我第一次做了一个真正属于自己的决定。', speaker: 's2', t_start: 104, t_end: 117, cut_status: 'keep', section_id: 'sec_path' },
-  { id: 'chunk_009', text: '你后悔过吗？', speaker: 's1', t_start: 119, t_end: 122, cut_status: 'maybe', cut_reason: '提问过于简短，节目里已有更完整的表述', section_id: 'sec_path' },
-  { id: 'chunk_010', text: '从来没有。反而觉得自己站在一个很奇特的位置，既懂技术逻辑，又有手上的东西。', speaker: 's2', t_start: 124, t_end: 137, cut_status: 'keep', section_id: 'sec_path' },
+  { id: 'chunk_001', text: '好，我们今天聊聊AI时代通识教育的困境，很多人学的东西正在被模型替代。', speaker: 's1', t_start: 0,   t_end: 12,  cut_status: 'keep', section_id: 'sec_ai', words: mockWords('好，我们今天聊聊AI时代通识教育的困境，很多人学的东西正在被模型替代。', 0, 12) },
+  { id: 'chunk_002', text: '对，我觉得现在大学里教的很多技能，比如写报告、做数据分析，GPT都能做得比人好。', speaker: 's2', t_start: 14,  t_end: 29,  cut_status: 'keep', section_id: 'sec_ai', words: mockWords('对，我觉得现在大学里教的很多技能，比如写报告、做数据分析，GPT都能做得比人好。', 14, 29) },
+  { id: 'chunk_003', text: '那你觉得什么样的技能是真正不可替代的？边缘的、小众的那种？', speaker: 's1', t_start: 31,  t_end: 40,  cut_status: 'keep', section_id: 'sec_ai', words: mockWords('那你觉得什么样的技能是真正不可替代的？边缘的、小众的那种？', 31, 40) },
+  { id: 'chunk_004', text: '我认识一个修古董钟表的人，他的手艺需要二十年积累，AI完全没办法复制那种触感判断。', speaker: 's2', t_start: 42,  t_end: 58,  cut_status: 'keep', section_id: 'sec_ai', words: mockWords('我认识一个修古董钟表的人，他的手艺需要二十年积累，AI完全没办法复制那种触感判断。', 42, 58) },
+  { id: 'chunk_005', text: '这让我想到你当初的决策——你是怎么走上现在这条路的？', speaker: 's1', t_start: 60,  t_end: 69,  cut_status: 'keep', section_id: 'sec_path', words: mockWords('这让我想到你当初的决策——你是怎么走上现在这条路的？', 60, 69) },
+  { id: 'chunk_006', text: '其实我大学学的是金融，但第三年突然觉得那条路太可预测了，就去学了焊接。', speaker: 's2', t_start: 71,  t_end: 87,  cut_status: 'keep', section_id: 'sec_path', words: mockWords('其实我大学学的是金融，但第三年突然觉得那条路太可预测了，就去学了焊接。', 71, 87), interjections: [{ speakerId: 's1', start: 78, end: 79.5, text: '哇真的吗' }] },
+  { id: 'chunk_007', text: '说回AI替代这个话题，我觉得最危险的不是体力劳动，而是那种中等复杂度的脑力工作。', speaker: 's2', t_start: 88,  t_end: 103, cut_status: 'keep', section_id: 'sec_path', words: mockWords('说回AI替代这个话题，我觉得最危险的不是体力劳动，而是那种中等复杂度的脑力工作。', 88, 103) },
+  { id: 'chunk_008', text: '所有人都觉得我疯了，但我觉得那是我第一次做了一个真正属于自己的决定。', speaker: 's2', t_start: 104, t_end: 117, cut_status: 'keep', section_id: 'sec_path', words: mockWords('所有人都觉得我疯了，但我觉得那是我第一次做了一个真正属于自己的决定。', 104, 117) },
+  { id: 'chunk_009', text: '你后悔过吗？', speaker: 's1', t_start: 119, t_end: 122, cut_status: 'maybe', cut_reason: '提问过于简短，节目里已有更完整的表述', section_id: 'sec_path', words: mockWords('你后悔过吗？', 119, 122) },
+  { id: 'chunk_010', text: '从来没有。反而觉得自己站在一个很奇特的位置，既懂技术逻辑，又有手上的东西。', speaker: 's2', t_start: 124, t_end: 137, cut_status: 'keep', section_id: 'sec_path', words: mockWords('从来没有。反而觉得自己站在一个很奇特的位置，既懂技术逻辑，又有手上的东西。', 124, 137) },
 ]
 
 const MOCK_SECTIONS: Section[] = [
@@ -99,24 +113,84 @@ export default function Workspace() {
   const [showExport, setShowExport] = useState(false)
   // 外部 seek 请求：用对象包装防止同值重复点击无效
   const [seekRequest, setSeekRequest] = useState<{ t: number; id: number } | undefined>()
+  // .podcut 工程文件路径（首次保存后记住，后续 Cmd+S 直接覆盖）
+  const [savedPath, setSavedPath] = useState<string | null>(null)
+
+  // ── Cmd+Z / Ctrl+Z 全局撤销 + Cmd+S 保存 ─────────────────────
+  useEffect(() => {
+    function handleKeyDown(e: KeyboardEvent) {
+      const target = e.target as HTMLElement
+      const inInput = target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable
+
+      // Cmd+Z / Ctrl+Z  →  撤销
+      if ((e.metaKey || e.ctrlKey) && e.key === 'z' && !e.shiftKey) {
+        if (inInput) return
+        e.preventDefault()
+        useProjectStore.getState().undoLastMove()
+        return
+      }
+
+      // Cmd+Shift+Z / Ctrl+Shift+Z  →  重做
+      if ((e.metaKey || e.ctrlKey) && e.key === 'z' && e.shiftKey) {
+        if (inInput) return
+        e.preventDefault()
+        useProjectStore.getState().redoLastMove()
+        return
+      }
+
+      // Cmd+S / Ctrl+S  →  保存工程文件
+      if ((e.metaKey || e.ctrlKey) && e.key === 's') {
+        e.preventDefault()
+        saveProjectFile(savedPath ?? undefined).then(p => {
+          if (p) setSavedPath(p)
+        })
+      }
+    }
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [savedPath])
 
   // ── 共用：跑 Ollama 识别 + Claude 章节分析 ──────────────────────
   async function runAnalysisPipeline(baseChunks: Chunk[], srcAudio: string) {
     const log = (msg: string) => console.log(`[Analysis] ${msg}`)
     const apiKey = localStorage.getItem('podcut_api_key') ?? ''
+    const hfToken = localStorage.getItem('podcut_hf_token') ?? ''
     try {
-      const ollamaModel = await detectOllama()
+      // 优先尝试 WhisperX（需要 HF token + whisperx 已安装）
       let diarized = baseChunks
-      if (ollamaModel) {
-        log(`diarize: using ${ollamaModel}`)
-        diarized = await diarizeWithOllama(baseChunks, ollamaModel, msg => {
-          useProjectStore.getState().setAnalysisStatus(msg)
-        })
-        log('diarize done')
+      let usedWhisperX = false
+
+      if (hfToken && isTauri()) {
+        const wx = await detectWhisperX()
+        if (wx.available) {
+          log(`diarize: using WhisperX v${wx.version}`)
+          try {
+            diarized = await diarizeWithWhisperX(srcAudio, hfToken, msg => {
+              useProjectStore.getState().setAnalysisStatus(msg)
+            })
+            usedWhisperX = true
+            log('WhisperX diarize done')
+          } catch (e) {
+            log(`WhisperX failed, falling back to Ollama: ${e}`)
+          }
+        }
       }
 
-      // 生成说话人分轨（后台并行）
-      if (isTauri() && ollamaModel) {
+      // 回退到 Ollama 文字识别说话人
+      if (!usedWhisperX) {
+        const ollamaModel = await detectOllama()
+        if (ollamaModel) {
+          log(`diarize: using Ollama ${ollamaModel}`)
+          diarized = await diarizeWithOllama(baseChunks, ollamaModel, msg => {
+            useProjectStore.getState().setAnalysisStatus(msg)
+          })
+          log('Ollama diarize done')
+        }
+      }
+
+      // 生成说话人分轨（后台并行）— 只要有说话人标注就分轨
+      const hasDiarization = diarized.some(c => c.speaker !== 's0')
+      if (isTauri() && hasDiarization) {
         const dir = srcAudio.substring(0, srcAudio.lastIndexOf('/'))
         const s1Segs = diarized.filter(c => c.speaker === 's1').map(c => [c.t_start, c.t_end] as [number, number])
         const s2Segs = diarized.filter(c => c.speaker === 's2').map(c => [c.t_start, c.t_end] as [number, number])
@@ -316,11 +390,13 @@ export default function Workspace() {
         <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
           <AppIcon size={24} />
           <span style={{ fontSize: '13px', fontWeight: 500, color: 'var(--text)' }}>PodCut</span>
+          <span style={{ fontSize: '10px', color: 'var(--text-muted)', fontVariantNumeric: 'tabular-nums' }}>v{__APP_VERSION__}</span>
         </div>
         <div style={{ width: '1px', height: '16px', background: 'var(--border)' }} />
-        <span style={{ fontSize: '13px', color: 'var(--text)', fontWeight: 400 }}>
-          {project.name}
-        </span>
+        <EditableTitle
+          value={project.name}
+          onChange={(name) => useProjectStore.getState().setProjectName(name)}
+        />
         <StageTag stage={project.stage} />
         {pendingOps > 0 && (
           <span style={{
@@ -332,10 +408,33 @@ export default function Workspace() {
           </span>
         )}
         <div style={{ flex: 1 }} />
+        {/* ── 工程文件操作（所有阶段可用，除 idle / processing） ── */}
+        {(project.stage === 'rough_cut' || isEditing) && (
+          <>
+            <HeaderBtn onClick={() => loadProjectFile()}>
+              打开
+            </HeaderBtn>
+            <HeaderBtn onClick={() => saveProjectFile(savedPath ?? undefined).then(p => { if (p) setSavedPath(p) })}>
+              {savedPath ? '保存' : '另存为'}
+            </HeaderBtn>
+          </>
+        )}
         {isEditing && (
           <>
             <HeaderBtn onClick={() => { console.log('[Workspace] backToRoughCut clicked'); backToRoughCut() }}>
               ← 返回粗剪
+            </HeaderBtn>
+            <HeaderBtn
+              onClick={() => useProjectStore.getState().undoLastMove()}
+              disabled={project.undo_stack.length === 0}
+            >
+              撤销
+            </HeaderBtn>
+            <HeaderBtn
+              onClick={() => useProjectStore.getState().redoLastMove()}
+              disabled={project.redo_stack.length === 0}
+            >
+              重做
             </HeaderBtn>
             <HeaderBtn onClick={() => setShowExport(true)}>导出</HeaderBtn>
           </>
@@ -355,6 +454,12 @@ export default function Workspace() {
               disabled={project.undo_stack.length === 0}
             >
               撤销
+            </HeaderBtn>
+            <HeaderBtn
+              onClick={() => useProjectStore.getState().redoLastMove()}
+              disabled={project.redo_stack.length === 0}
+            >
+              重做
             </HeaderBtn>
           </>
         )}
@@ -399,6 +504,52 @@ export default function Workspace() {
 }
 
 // ── 小组件 ───────────────────────────────────────────────────────────
+
+function EditableTitle({ value, onChange }: { value: string; onChange: (v: string) => void }) {
+  const [editing, setEditing] = useState(false)
+  const [draft, setDraft] = useState(value)
+
+  function commit() {
+    const trimmed = draft.trim()
+    if (trimmed && trimmed !== value) onChange(trimmed)
+    else setDraft(value)
+    setEditing(false)
+  }
+
+  if (editing) {
+    return (
+      <input
+        autoFocus
+        value={draft}
+        onChange={e => setDraft(e.target.value)}
+        onBlur={commit}
+        onKeyDown={e => { if (e.key === 'Enter') commit(); if (e.key === 'Escape') { setDraft(value); setEditing(false) } }}
+        style={{
+          fontSize: '13px', color: 'var(--text)', fontWeight: 400,
+          background: 'transparent', border: 'none',
+          borderBottom: '1px solid var(--accent)',
+          outline: 'none', padding: '0 2px', width: Math.max(80, draft.length * 8 + 20),
+        }}
+      />
+    )
+  }
+
+  return (
+    <span
+      onClick={() => { setDraft(value); setEditing(true) }}
+      title="点击改名"
+      style={{
+        fontSize: '13px', color: 'var(--text)', fontWeight: 400,
+        cursor: 'text', borderBottom: '1px solid transparent',
+        transition: 'border-color 0.15s',
+      }}
+      onMouseEnter={e => e.currentTarget.style.borderBottom = '1px dashed var(--border-mid)'}
+      onMouseLeave={e => e.currentTarget.style.borderBottom = '1px solid transparent'}
+    >
+      {value}
+    </span>
+  )
+}
 
 function HeaderBtn({ children, onClick, disabled }: {
   children: React.ReactNode; onClick?: () => void; disabled?: boolean

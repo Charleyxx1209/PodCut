@@ -7,6 +7,12 @@
     "core:default",
     "dialog:default",
     "shell:default",
+    {
+      "identifier": "shell:allow-execute",
+      "allow": [
+        { "name": "open", "cmd": "open", "args": true }
+      ]
+    },
     "fs:default",
     "fs:allow-read-file",
     "fs:allow-write-file",
